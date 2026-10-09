@@ -1,7 +1,33 @@
 use core::mem::MaybeUninit;
 
 use arduino_hal::Eeprom;
-use avr_device::atmega328p::EEPROM;
+use avr_device::{atmega328p::EEPROM, interrupt};
+
+use crate::ringbuffer::find_ringbuffer_head;
+
+/**
+The EEPROM write sequence requires setting EEPE within 4 cycles of EEMPE. avr-hal
+doesn't disable interrupts around that, so any interrupt landing in between makes
+the write silently fail. Wait for any previous write to finish first (so interrupts
+aren't held off for milliseconds), then do the write itself in a critical section.
+*/
+fn write_byte_atomic(eeprom: &mut Eeprom, address: u16, value: u8) {
+    let regs = unsafe { &*EEPROM::ptr() };
+    while regs.eecr.read().eepe().bit_is_set() {}
+    interrupt::free(|_| eeprom.write_byte(address, value));
+}
+
+fn erase_byte_atomic(eeprom: &mut Eeprom, address: u16) {
+    let regs = unsafe { &*EEPROM::ptr() };
+    while regs.eecr.read().eepe().bit_is_set() {}
+    interrupt::free(|_| eeprom.erase_byte(address));
+}
+
+fn write_atomic(eeprom: &mut Eeprom, address: u16, data: &[u8]) {
+    for (i, byte) in data.iter().enumerate() {
+        write_byte_atomic(eeprom, address + i as u16, *byte);
+    }
+}
 
 /**
 Every time the writer is initialized (i.e. on device startup) the full object is
@@ -48,34 +74,35 @@ impl<const SIZE: usize> WearLevelledEepromWriter<SIZE> {
 
     fn write_data(&mut self, data: &[u8; SIZE]) {
         let marker_bytes = self.version.to_le_bytes();
-        self.eeprom.erase_byte(self.address + 1);
-        self.eeprom.write(self.address + 2, data).unwrap();
-        self.eeprom.write_byte(self.address + 0, marker_bytes[0]);
-        self.eeprom.write_byte(self.address + 1, marker_bytes[1]);
+        erase_byte_atomic(&mut self.eeprom, self.address + 1);
+        write_atomic(&mut self.eeprom, self.address + 2, data);
+        write_byte_atomic(&mut self.eeprom, self.address + 0, marker_bytes[0]);
+        write_byte_atomic(&mut self.eeprom, self.address + 1, marker_bytes[1]);
     }
 
     fn advance_and_copy(&mut self) -> [u8; SIZE] {
-        let mut new_address = self.address + Self::TOTAL_SIZE;
-        if new_address + Self::TOTAL_SIZE > self.eeprom.capacity() {
-            new_address = 0;
-        }
-        let new_version = self.version + 1;
-        if new_version >> 8 == 0xFF {
-            self.clear();
-            // NOTE resetting the address on version overflow is not ideal,
-            // but it lets us keep the order invariant which loads much faster
-            self.address = 0;
-        }
-
         let mut data: [u8; SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
         self.eeprom.read(self.address + 2, &mut data).unwrap();
 
-        self.eeprom.erase_byte(new_address + 1);
-        self.eeprom.write(new_address + 2, &data).unwrap();
+        let (new_address, new_version) = if (self.version + 1) >> 8 == 0xFF {
+            // The version is about to collide with the "empty" marker (MSB 0xFF).
+            // Start the ring over from the beginning. Resetting the address isn't
+            // ideal for wear, but it keeps the order invariant which loads much faster.
+            self.clear();
+            (0, 0)
+        } else {
+            let mut new_address = self.address + Self::TOTAL_SIZE;
+            if new_address + Self::TOTAL_SIZE > self.eeprom.capacity() {
+                new_address = 0;
+            }
+            (new_address, self.version + 1)
+        };
+
+        erase_byte_atomic(&mut self.eeprom, new_address + 1);
+        write_atomic(&mut self.eeprom, new_address + 2, &data);
         let new_version_bytes = new_version.to_le_bytes();
-        self.eeprom.write_byte(new_address, new_version_bytes[0]);
-        self.eeprom
-            .write_byte(new_address + 1, new_version_bytes[1]);
+        write_byte_atomic(&mut self.eeprom, new_address, new_version_bytes[0]);
+        write_byte_atomic(&mut self.eeprom, new_address + 1, new_version_bytes[1]);
 
         self.address = new_address;
         self.version = new_version;
@@ -86,8 +113,7 @@ impl<const SIZE: usize> WearLevelledEepromWriter<SIZE> {
     fn clear_all(eeprom: &mut Eeprom) {
         for address in (0..=eeprom.capacity() - Self::TOTAL_SIZE).step_by(Self::TOTAL_SIZE as usize)
         {
-            // eeprom.erase_byte(address);
-            eeprom.erase_byte(address + 1);
+            erase_byte_atomic(eeprom, address + 1);
         }
     }
 
@@ -96,16 +122,16 @@ impl<const SIZE: usize> WearLevelledEepromWriter<SIZE> {
             (0..=self.eeprom.capacity() - Self::TOTAL_SIZE).step_by(Self::TOTAL_SIZE as usize)
         {
             if address != self.address {
-                self.eeprom.erase_byte(address + 1);
+                erase_byte_atomic(&mut self.eeprom, address + 1);
             }
         }
-        self.eeprom.erase_byte(self.address);
-        self.eeprom.erase_byte(self.address + 1);
+        erase_byte_atomic(&mut self.eeprom, self.address);
+        erase_byte_atomic(&mut self.eeprom, self.address + 1);
     }
 
     pub fn update_byte(&mut self, offset: u16, byte: u8) {
         debug_assert!(offset < Self::DATA_SIZE);
-        self.eeprom.write_byte(self.address + 2 + offset, byte);
+        write_byte_atomic(&mut self.eeprom, self.address + 2 + offset, byte);
     }
 
     fn load_version_number(eeprom: &Eeprom, index: u16) -> u16 {
@@ -120,46 +146,9 @@ impl<const SIZE: usize> WearLevelledEepromWriter<SIZE> {
     }
 
     pub fn binary_search_for_monotonic_ringbuffer_head(eeprom: &Eeprom) -> (u16, u16) {
-        let midpoint = |low, high| {
-            debug_assert!(low <= high);
-            low + (high - low) / 2
-        };
-
-        let gt = |a, b| {
-            if b == 0xFFFF && a != 0xFFFF {
-                true
-            } else {
-                a > b
-            }
-        };
-
         let len = eeprom.capacity() / Self::TOTAL_SIZE;
-        let mut low_idx = 0;
-        let mut high_idx = len - 1;
-        let mut mid_idx = midpoint(low_idx, high_idx);
-        let mut low_value = Self::load_version_number(eeprom, low_idx);
-        let mut mid_value = Self::load_version_number(eeprom, mid_idx);
-        let mut high_value = Self::load_version_number(eeprom, high_idx);
-
-        loop {
-            if gt(low_value, mid_value) {
-                if low_idx + 1 == mid_idx {
-                    return (low_idx * Self::TOTAL_SIZE, low_value);
-                }
-                high_idx = mid_idx;
-                high_value = mid_value;
-            } else if gt(mid_value, high_value) {
-                if mid_idx + 1 == high_idx {
-                    return (mid_idx * Self::TOTAL_SIZE, mid_idx);
-                }
-                low_idx = mid_idx;
-                low_value = mid_value;
-            } else {
-                return (low_idx * Self::TOTAL_SIZE, low_value);
-            }
-
-            mid_idx = midpoint(low_idx, high_idx);
-            mid_value = Self::load_version_number(eeprom, mid_idx);
-        }
+        let (index, version) =
+            find_ringbuffer_head(len, |i| Self::load_version_number(eeprom, i));
+        (index * Self::TOTAL_SIZE, version)
     }
 }

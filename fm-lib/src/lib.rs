@@ -17,6 +17,7 @@ pub mod eeprom;
 pub mod mcp4922;
 pub mod number_utils;
 pub mod nybl_pair;
+pub mod ringbuffer;
 pub mod rng;
 pub mod rotary_encoder;
 pub mod system_clock;
