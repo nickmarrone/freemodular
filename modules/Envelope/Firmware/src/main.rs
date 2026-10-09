@@ -342,8 +342,8 @@ fn main() -> ! {
         }
 
 
-        // The rest of the loop (knobs, button, LEDs) takes up to ~150 us. Only start
-        // it if it will finish before the next sample is due, so it can never delay
+        // The rest of the loop (knobs, button, LEDs) usually takes ~110 us. Only start
+        // it if it will finish before the next sample is due, so it doesn't delay
         // computing one; it runs in whatever time the envelope math leaves over.
         if DAC_WRITE_QUEUED.atomic_read() && dp.TC2.tcnt2.read().bits() > SAMPLE_TICKS - UI_MAX_TICKS
         {

@@ -7,7 +7,7 @@
 
 <h1>Envelope</h1>
 
-<p>A simple but powerful envelope generator that can cycle between 4 separate modes: traditional ADSR, AR with tunable curves, and two looping modes. Hold the mode button to switch to a long time range (up to 100 seconds per stage).</p>
+<p>A simple but powerful envelope generator with 8 modes: traditional ADSR, AR with tunable curves, two looping modes, a slew limiter, ratcheting bursts, a random loop and a bouncing ball. Hold the mode button to switch to a long time range (up to 100 seconds per stage), or hold it and turn a knob to set ADSR curves, retrigger behaviour (continue, reset, legato or cycle) and the aux output mode.</p>
 
 <h2>Resources</h2>
 
