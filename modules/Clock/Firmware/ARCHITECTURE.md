@@ -5,7 +5,7 @@ performance problems found in the original firmware (and how they were fixed), a
 comparison with popular Eurorack clocks, and the feature roadmap.
 
 **Status (Oct 2026):** All Tier 1 and Tier 2 items below are implemented. Tier 3 needs
-hardware. Measurements were taken in simavr (see [§7 Testing](#7-testing)). They have
+hardware. Measurements were taken in simavr (see [§7 Building and testing](#7-building-and-testing)). They have
 **not** been verified on a physical module yet.
 
 ---
@@ -287,7 +287,34 @@ panel space. A small 2–4 HP expander on J13 avoids redesigning the 8 HP panel.
 
 ---
 
-## 7. Testing
+## 7. Building and testing
+
+### Building and flashing
+
+**Prerequisites.** The pinned nightly toolchain (`nightly-2025-01-03` with `rust-src`,
+installed automatically by `rustup` from `rust-toolchain.toml`), `avr-gcc`/`avr-binutils`
+(`sudo apt install gcc-avr binutils-avr`), and `ravedude` (`cargo install ravedude`) for
+flashing. The `.cargo/config.toml` already selects the `avr-specs/avr-atmega328p.json`
+target and `build-std = ["core"]`, so no `--target` flag is needed.
+
+```
+cd modules/Clock/Firmware
+
+# build (output: target/avr-atmega328p/release/fm-clock.elf)
+cargo build --release
+
+# flash an Arduino Nano over USB (runs `ravedude nano-new -cb 57600`, opens a serial console)
+RAVEDUDE_PORT=/dev/ttyUSB0 cargo run --release
+
+# or produce the HEX that is published with the module (this is what `build.py` does)
+avr-objcopy -O ihex target/avr-atmega328p/release/fm-clock.elf fm-clock.hex
+avr-size target/avr-atmega328p/release/fm-clock.elf
+```
+
+Always build with `--release`: the `dev` profile does not fit in flash under the
+Optiboot bootloader (see §1). Check the `avr-size` text+data total stays under 32,256 B.
+
+### Testing
 
 **Host unit tests** (`modules/Clock/tests/engine`) compile `clock.rs` and `menu/utils.rs`
 for the host and drive the executor tick by tick. Hardware access is behind

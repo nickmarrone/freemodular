@@ -101,6 +101,31 @@ The curved modes previously had only ~40 µs of headroom per sample. They now ha
   inverse. With the new headroom the inverse and the next sample would now fit in one
   period.
 
+## Building and flashing
+
+**Prerequisites.** The pinned nightly toolchain (`nightly-2025-01-03` with `rust-src`,
+installed automatically by `rustup` from `rust-toolchain.toml`), `avr-gcc`/`avr-binutils`
+(`sudo apt install gcc-avr binutils-avr`), and `ravedude` (`cargo install ravedude`) for
+flashing. The `.cargo/config.toml` already selects the `avr-specs/avr-atmega328p.json`
+target and `build-std = ["core"]`, so no `--target` flag is needed.
+
+```
+cd modules/Envelope/Firmware
+
+# build (output: target/avr-atmega328p/release/fm-envelope.elf)
+cargo build --release
+
+# flash an Arduino Nano over USB (runs `ravedude nano-new -cb 57600`, opens a serial console)
+RAVEDUDE_PORT=/dev/ttyUSB0 cargo run --release
+
+# or produce the HEX that is published with the module (this is what `build.py` does)
+avr-objcopy -O ihex target/avr-atmega328p/release/fm-envelope.elf fm-envelope.hex
+avr-size target/avr-atmega328p/release/fm-envelope.elf
+```
+
+Always build with `--release`. The `debug` cargo feature (`--features debug`) is only
+for development builds.
+
 ## Testing
 
 - **Host unit tests** (`modules/Envelope/tests/math`) cover:
