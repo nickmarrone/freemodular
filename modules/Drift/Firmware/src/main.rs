@@ -171,9 +171,10 @@ fn configure_timer_interrupt(tc0: &arduino_hal::pac::TC0) {
     // reset timer counter at TOP set by OCRA
     tc0.tccr0a.write(|w| w.wgm0().ctc());
     // set timer frequency to cycle at 2.5kHz
-    // (16MHz clock speed / 64 prescale factor / 100 count/reset )
+    // (16MHz clock speed / 64 prescale factor / 100 counts; the counter goes 0..=OCR0A)
     tc0.tccr0b.write(|w| w.cs0().prescale_64());
-    tc0.ocr0a.write(|w| w.bits(100));
+    const COUNTS_PER_SAMPLE: u32 = shared::MICROS_PER_SAMPLE * 16 / 64;
+    tc0.ocr0a.write(|w| w.bits(COUNTS_PER_SAMPLE as u8 - 1));
 
     // enable interrupt on match to compare register A
     tc0.timsk0.write(|w| w.ocie0a().set_bit());

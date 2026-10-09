@@ -1,0 +1,11 @@
+# LFO mode: speed knob steps, speed CV, texture sweep mid-cycle
+0 cv 2 600
+0 cv 3 500
+2000 cv 2 800
+4000 cv 2 1000
+6000 cv 0 1000
+8000 cv 0 0
+8000 cv 2 700
+8000 cv 3 0
+9000 cv 3 1000
+10000 cv 3 500

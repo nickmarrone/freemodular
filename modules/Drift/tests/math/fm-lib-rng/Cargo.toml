@@ -1,0 +1,6 @@
+# Just fm-lib's RNG, which (unlike the rest of fm-lib) builds for the host
+[package]
+name = "fm-lib-rng"
+version = "0.1.0"
+edition = "2021"
+publish = false

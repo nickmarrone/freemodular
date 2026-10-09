@@ -1,0 +1,17 @@
+# Host-side unit tests for the Drift algorithms. The firmware only builds for AVR,
+# so its hardware-independent source files are pulled in directly.
+#
+#   cd modules/Drift/tests/math && cargo test --release
+[package]
+name = "fm-drift-math-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+fixed = "1.27.0"
+avr-progmem = "0.4.0"
+fm_lib = { path = "fm-lib-rng", package = "fm-lib-rng" }
+
+[lib]
+doctest = false

@@ -1,26 +1,29 @@
-use fixed::{types::extra::U16, FixedU16};
 use fm_lib::rng::ParallelLfsr;
 
-use crate::shared::DriftModule;
+use crate::shared::{exp2_sixteenths, DriftModule};
 
 pub struct BrownianModuleState {
     target_value: u16,
-    current_value: u16,
+    /// The smoothed output with 16 fractional bits, so that small steps toward
+    /// the target add up instead of rounding away
+    current_value: u32,
     rng: ParallelLfsr,
 }
 
 impl BrownianModuleState {
     pub fn new(random_seed: u16) -> Self {
         let rng = ParallelLfsr::new(random_seed);
+        // start in the middle of the range rather than pinned at the bottom
+        const START: u16 = 1 << 15;
         Self {
-            target_value: 0,
-            current_value: 0,
+            target_value: START,
+            current_value: (START as u32) << 16,
             rng,
         }
     }
 
     fn step_target_value(&mut self, cv: u16) {
-        let step_size = 256 + cv >> 1;
+        let step_size = (256 + cv) >> 1;
         let cutoff = cv << 6;
 
         let random = self.rng.next();
@@ -44,23 +47,25 @@ impl BrownianModuleState {
     }
 
     fn step_smoothed_value(&mut self, cv: u16) {
+        let target = (self.target_value as u32) << 16;
         if cv >= 1020 {
-            self.current_value = self.target_value;
+            self.current_value = target;
             return;
         }
 
-        let cv_fixed = FixedU16::<U16>::from_bits(cv);
-        let delta = FixedU16::<U16>::from_bits(self.current_value.abs_diff(self.target_value));
+        // Exponential from 16/65536 of the way per sample (a ~1.6s time constant) at 0
+        // to 1/8 (~3ms) at the top, so the knob ends close to the unsmoothed
+        // signal instead of jumping to it from ~0.2s
+        const MAX_STEP_SIZE: u32 = 1 << 13;
+        let step_size = u32::min(exp2_sixteenths(((cv as u32 * 146) >> 10) as u16) >> 11, MAX_STEP_SIZE);
 
-        const MAX_STEP_SIZE: FixedU16<U16> = FixedU16::<U16>::from_bits(u16::MAX / 8);
-        const MIN_STEP_SIZE: FixedU16<U16> = FixedU16::<U16>::from_bits(u16::MAX / 4096);
-
-        let step_size = cv_fixed.lerp(MIN_STEP_SIZE, MAX_STEP_SIZE);
-
-        if self.current_value < self.target_value {
-            self.current_value += (step_size * delta).to_bits();
-        } else if self.current_value > self.target_value {
-            self.current_value -= (step_size * delta).to_bits();
+        // move `step_size` of the way to the target (both 16.16 fixed point)
+        let delta = self.current_value.abs_diff(target);
+        let step = (delta >> 16) * step_size + (((delta & 0xFFFF) * step_size) >> 16);
+        if self.current_value < target {
+            self.current_value += step;
+        } else {
+            self.current_value -= step;
         }
     }
 }
@@ -70,6 +75,6 @@ impl DriftModule for BrownianModuleState {
         // TODO: These controls would maybe be more useful if they had an exponential curve (especially texture)
         self.step_target_value(u16::min(1023, cv[2] + cv[0]));
         self.step_smoothed_value(u16::min(1023, cv[3] + cv[1]));
-        self.current_value >> 4
+        (self.current_value >> 20) as u16
     }
 }

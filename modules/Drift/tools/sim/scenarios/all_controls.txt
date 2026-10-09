@@ -1,0 +1,11 @@
+# sweep speed and texture through slow, medium and fast settings
+0 cv 2 300
+0 cv 3 0
+3000 cv 3 500
+6000 cv 3 1000
+9000 cv 2 800
+9000 cv 3 0
+11000 cv 3 1000
+13000 cv 2 1000
+13000 cv 0 1000
+14000 cv 3 500

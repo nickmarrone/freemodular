@@ -31,13 +31,10 @@ impl BezierModuleState {
 
     fn step_time(&mut self, knob: u16, cv: u16) -> (u32, bool) {
         let dt = get_delta_t(knob, cv, self.speed_adjust);
-        self.time = self.time.saturating_add(dt);
-        let rollover = self.time == u32::MAX;
-        let before_rollover = self.time;
-        if rollover {
-            self.time = 0;
-        }
-        (before_rollover, rollover)
+        // wrap rather than restart at 0 so no fraction of a sample is lost per segment
+        let (time, rollover) = self.time.overflowing_add(dt);
+        self.time = time;
+        (time, rollover)
     }
 
     fn get_speed_adjust(&mut self, knob: u16, cv: u16) -> i16 {
@@ -136,7 +133,6 @@ impl DriftModule for BezierModuleState {
             self.value_a = self.value_b;
             self.value_b = FixedU16::<U12>::from_bits(self.rng.next() >> 4);
             self.speed_adjust = self.get_speed_adjust(cv[3], cv[1]);
-            return self.value_a.to_bits();
         }
 
         let t_fixed = FixedU16::<U12>::from_bits((t >> 20) as u16);

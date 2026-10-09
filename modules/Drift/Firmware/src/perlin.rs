@@ -119,7 +119,7 @@ Instead of interpolating between random values, perlin noise effectively interpo
 between different gradients/slopes for a much smoother and more organic looking curve.
 Returns a fixed point between -.25 and +.25
 */
-fn perlin_segment(x: U0F16, last_grad: I1F15, next_grad: I1F15) -> I1F15 {
+pub(crate) fn perlin_segment(x: U0F16, last_grad: I1F15, next_grad: I1F15) -> I1F15 {
     const ONE: I1F15 = I1F15::from_bits(0x7FFF);
 
     let u = fade(x);
