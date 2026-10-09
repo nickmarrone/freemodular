@@ -320,4 +320,5 @@ tools/sim/analyze.py tools/sim/out/portd.log
 Caveats:
 - simavr's SPI takes ~100 µs per byte (real: ~1 µs), so simulated redraws are ~100× slower
   than on hardware. Scripted button presses should be held ≥250 ms.
-- simavr re-applies pull-ups on PORTC writes; the harness re-asserts the held button levels.
+- Inputs are registered as externally driven (`AVR_IOCTL_IOPORT_SET_EXTERNAL`); otherwise
+  simavr's pull-up emulation overrides them on every port write.

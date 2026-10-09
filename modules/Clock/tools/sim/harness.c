@@ -11,6 +11,8 @@
 //
 // Note: simavr's SPI takes ~100us per byte (real hardware: ~1us), so display
 // updates are ~100x slower than on the module. Hold simulated buttons for 250ms+.
+// Inputs are registered as externally driven (AVR_IOCTL_IOPORT_SET_EXTERNAL);
+// otherwise simavr's pull-up emulation overrides them on every port write.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +23,18 @@
 
 static FILE *out;
 static avr_t *avr;
+
+// Drive an input pin from outside. Registering it as externally driven stops
+// simavr's pull-up emulation from overriding it whenever the port is written.
+static uint8_t ext_mask[3], ext_value[3];
+static void set_pin(char port, int bit, int level) {
+    int i = port - 'B';
+    ext_mask[i] |= 1 << bit;
+    ext_value[i] = level ? ext_value[i] | (1 << bit) : ext_value[i] & ~(1 << bit);
+    avr_ioport_external_t ext = { .name = port, .mask = ext_mask[i], .value = ext_value[i] };
+    avr_ioctl(avr, AVR_IOCTL_IOPORT_SET_EXTERNAL(port), &ext);
+    avr_raise_irq(avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ(port), bit), level);
+}
 static void portd_cb(struct avr_irq_t *irq, uint32_t value, void *param) {
     fprintf(out, "%llu %u\n", (unsigned long long)avr->cycle, value & 0xff);
 }
@@ -53,25 +67,20 @@ int main(int argc, char **argv) {
     }
     out = fopen("portd.log", "w");
     avr_irq_register_notify(avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ('D'), IOPORT_IRQ_PIN_ALL), portd_cb, 0);
-    avr_irq_t *pc3 = avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ('C'), 3);
-    avr_irq_t *pc4 = avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ('C'), 4);
-    avr_irq_t *pb0 = avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ('B'), 0);
-    avr_irq_t *pb1 = avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ('B'), 1);
-    // buttons/encoder idle high (external pull-ups)
-    avr_raise_irq(pc3, 1); avr_raise_irq(pc4, 1); avr_raise_irq(pb0, 1); avr_raise_irq(pb1, 1);
+    // buttons/encoder idle high (switches to ground)
+    set_pin('C', 3, 1); set_pin('C', 4, 1); set_pin('B', 0, 1); set_pin('B', 1, 1);
 
     uint64_t end = seconds * 16000000, isr_cycles = 0, isr_max = 0, isr_entry = 0;
-    int want_c3 = 1, want_c4 = 1;
     int in_isr = 0, enc_phase = 0, enc_dir = 0; uint64_t enc_next = 0;
     // quadrature sequence for one detent (reversed for the other direction)
     static const int seq[4][2] = {{0,1},{0,0},{1,0},{1,1}};
     while (avr->cycle < end) {
         while (next < nev && avr->cycle >= evs[next].cycle) {
             char *a = evs[next].action;
-            if (!strcmp(a, "enc_down")) want_c4 = 0;
-            else if (!strcmp(a, "enc_up")) want_c4 = 1;
-            else if (!strcmp(a, "pause_down")) want_c3 = 0;
-            else if (!strcmp(a, "pause_up")) want_c3 = 1;
+            if (!strcmp(a, "enc_down")) set_pin('C', 4, 0);
+            else if (!strcmp(a, "enc_up")) set_pin('C', 4, 1);
+            else if (!strcmp(a, "pause_down")) set_pin('C', 3, 0);
+            else if (!strcmp(a, "pause_up")) set_pin('C', 3, 1);
             else if (!strcmp(a, "cw")) { enc_dir = 1; enc_phase = 0; enc_next = avr->cycle; }
             else if (!strcmp(a, "ccw")) { enc_dir = -1; enc_phase = 0; enc_next = avr->cycle; }
             next++;
@@ -79,7 +88,7 @@ int main(int argc, char **argv) {
         if (enc_dir && avr->cycle >= enc_next) {
             int a = seq[enc_phase][0], b = seq[enc_phase][1];
             if (enc_dir > 0) { int t = a; a = b; b = t; }
-            avr_raise_irq(pb0, a); avr_raise_irq(pb1, b);
+            set_pin('B', 0, a); set_pin('B', 1, b);
             enc_next = avr->cycle + 16000; // 1ms per quadrature step
             if (++enc_phase == 4) enc_dir = 0;
         }
@@ -98,10 +107,6 @@ int main(int argc, char **argv) {
         if (!pc_in && in_isr) {
             in_isr = 0; uint64_t d = avr->cycle - isr_entry; isr_cycles += d; if (d > isr_max) isr_max = d;
         }
-        // simavr re-applies pull-ups whenever PORTC is written (the display DC/CS pins
-        // live there), so keep forcing the externally driven button levels
-        if (((avr->data[0x26] >> 4) & 1) != want_c4) { avr_raise_irq(pc4, !want_c4); avr_raise_irq(pc4, want_c4); }
-        if (((avr->data[0x26] >> 3) & 1) != want_c3) { avr_raise_irq(pc3, !want_c3); avr_raise_irq(pc3, want_c3); }
         int state = avr_run(avr);
         if (state == cpu_Done || state == cpu_Crashed) { fprintf(stderr, "cpu state %d at pc %x\n", state, avr->pc); break; }
     }
