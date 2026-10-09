@@ -8,6 +8,8 @@ edition = "2021"
 
 [features]
 debug = []
+# Sets the spare pin D9 high while computing each sample, so the simulator can time it
+profile = []
 
 [[bin]]
 name = "fm-envelope"

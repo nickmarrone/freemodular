@@ -179,16 +179,20 @@ fn exp_curve_inverse_positive(x: FixedU16<U16>, c: FixedU16<U16>) -> FixedU16<U1
         return x;
     }
 
-    const ONE: FixedU32<U16> = FixedU32::<U16>::from_bits(1u32 << 16);
+    // a = x * (2^16c - 1) + 1, all in 16.16. The product is split into two 32-bit
+    // multiplies because 64-bit math is very slow on AVR.
+    let coefficient = exp2_lut(c).to_bits() - (1 << 16);
+    let x = x.to_bits() as u32;
+    let a = (coefficient >> 16) * x + (((coefficient & 0xFFFF) * x) >> 16) + (1 << 16);
 
-    let coefficient = exp2_lut(c) - ONE;
-    let a = (Into::<FixedU32<U16>>::into(x) * coefficient) + ONE;
-
-    let numerator = fixed_point_log2(a);
-    let denominator = FixedU32::<U16>::from(c) * 16;
-    debug_assert!(denominator != 0);
+    // log2(a) / 16c. log2(a) < 16, so (as 16.16) it fits in 20 bits and can be
+    // shifted up 11 bits for the division; 16c is c << 4 in 16.16, whose low 4 bits
+    // are zero, so dividing by c instead covers 4 more. One last bit is lost.
+    let numerator = fixed_point_log2(FixedU32::<U16>::from_bits(a)).to_bits();
+    debug_assert!(numerator < 1 << 20);
+    let ratio = ((numerator << 11) / c.to_bits() as u32) << 1;
 
     // Table rounding can push the ratio slightly past 1; clamp instead of wrapping
     // around to 0 (which would restart the stage from the bottom)
-    FixedU16::<U16>::from_bits(u32::min((numerator / denominator).to_bits(), u16::MAX as u32) as u16)
+    FixedU16::<U16>::from_bits(u32::min(ratio, u16::MAX as u32) as u16)
 }

@@ -3,6 +3,7 @@
 #
 #   tools/sim/run_sim.sh <seconds> [scenario.txt]
 #   tools/sim/analyze.py out/          # sample timing, compute headroom, envelope sketch
+#   FEATURES=profile tools/sim/run_sim.sh ...   # also time just the envelope math
 #
 # Needs simavr's library and headers: `sudo apt install libsimavr-dev`, or point
 # SIMAVR_ROOT at a directory containing usr/include/simavr and usr/lib/... (for
@@ -20,7 +21,7 @@ if [ ! -x "$OUT/harness" ] || [ "$HERE/harness.c" -nt "$OUT/harness" ]; then
         -Wl,-rpath,"$LIBDIR"
 fi
 (cd "$FW" && CARGO_PROFILE_RELEASE_STRIP=none CARGO_TARGET_DIR="$OUT/target" \
-    cargo build --release 2>&1 | grep -E '^error' -A5 || true)
+    cargo build --release ${FEATURES:+--features $FEATURES} 2>&1 | grep -E '^error' -A5 || true)
 ELF=$OUT/target/avr-atmega328p/release/fm-envelope.elf
 avr-size "$ELF" | tail -1
 SCRIPT=${2:+$(realpath "$2")}

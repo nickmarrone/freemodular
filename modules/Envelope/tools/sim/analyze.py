@@ -24,6 +24,24 @@ for lo, hi, label in windows:
         print(f"{label:12s} compute per sample: avg {sum(seg) / len(seg) / 16:5.0f} us, "
               f"max {max(seg) / 16:5.0f} us (budget {period / 16:.0f} us)")
 
+# with FEATURES=profile, pin P is high while the envelope math runs and pin U during
+# the UI part of the main loop; on hardware a sample takes about P plus a few us
+spans, rise = {"P": [], "U": []}, {}
+for line in open(os.path.join(out, "io.log")):
+    cycle, pin, level = line.split()
+    if pin in spans:
+        if level == "1":
+            rise[pin] = int(cycle)
+        elif pin in rise:
+            start = rise.pop(pin)
+            spans[pin].append((start, int(cycle) - start))
+for pin, label_suffix in (("P", "envelope math"), ("U", "UI pass")):
+    for lo, hi, label in windows if spans[pin] else []:
+        seg = [d for t, d in spans[pin] if lo * CYCLES_PER_S <= t < hi * CYCLES_PER_S]
+        if seg:
+            print(f"{label:12s} {label_suffix + ':':20s}avg {sum(seg) / len(seg) / 16:5.0f} us, "
+                  f"max {max(seg) / 16:5.0f} us")
+
 step, t, j, sketch = int(0.25 * CYCLES_PER_S), 0, 0, []
 while t < dac[-1][0]:
     while j < len(dac) - 1 and dac[j + 1][0] <= t:

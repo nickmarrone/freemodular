@@ -1,0 +1,38 @@
+# ADSR, default knobs: attack 200, decay 300, sustain 600, release 300 (permille)
+# 1. linear reference envelope
+200 gate_on
+1200 gate_off
+# 2. exponential attack (curve knob right), log decay/release (left)
+2500 btn_down
+2900 cv 0 1000
+3000 cv 1 0
+3200 btn_up
+# turn the knobs back to pick their parameters up again
+3400 cv 0 200
+3450 cv 1 300
+3600 gate_on
+4600 gate_off
+# 3. gate behaviour: reset. A retrigger during the release restarts from 0
+6000 btn_down
+6400 cv 2 400
+6500 btn_up
+6700 cv 2 600
+7000 gate_on
+7600 gate_off
+7800 gate_on
+8300 gate_off
+# 4. gate behaviour: cycle. Holding the gate loops attack -> decay
+9500 btn_down
+9900 cv 2 1000
+10000 btn_up
+10200 cv 2 600
+10500 gate_on
+13500 gate_off
+# 5. gate behaviour: legato. A trigger while the gate is held is ignored
+15000 btn_down
+15400 cv 2 520
+15500 btn_up
+15700 cv 2 600
+15800 gate_on
+16800 trig
+17000 gate_off

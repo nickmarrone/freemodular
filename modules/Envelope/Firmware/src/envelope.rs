@@ -11,7 +11,7 @@ pub use self::acrc::{AcrcLoopState, AcrcState};
 pub use self::adsr::AdsrState;
 pub use self::ahrd::AhrdState;
 pub use self::shared::set_long_time_range;
-use crate::settings::led;
+use crate::settings::{led, EnvelopeConfig};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum GateState {
@@ -106,7 +106,12 @@ pub const fn ui_show_stage(state: &EnvelopeMode) -> u8 {
     .reverse_bits()
 }
 
-pub fn update(state: &mut EnvelopeState, input: &Input, cv: &[u16; 4]) -> (u16, bool) {
+pub fn update(
+    state: &mut EnvelopeState,
+    input: &Input,
+    cv: &[u16; 4],
+    config: &EnvelopeConfig,
+) -> (u16, bool) {
     let (value, rollover) = match state.mode {
         EnvelopeMode::Adsr(ref mut phase) => adsr(
             phase,
@@ -115,6 +120,7 @@ pub fn update(state: &mut EnvelopeState, input: &Input, cv: &[u16; 4]) -> (u16, 
             input,
             cv,
             &mut state.artificial_gate,
+            config,
         ),
         EnvelopeMode::Acrc(ref mut phase) => acrc(
             phase,
@@ -123,6 +129,7 @@ pub fn update(state: &mut EnvelopeState, input: &Input, cv: &[u16; 4]) -> (u16, 
             input,
             cv,
             &mut state.artificial_gate,
+            config,
         ),
         EnvelopeMode::AcrcLoop(ref mut phase) => acrc_loop(phase, &mut state.time, input, cv),
         EnvelopeMode::AhrdLoop(ref mut phase) => ahrd(phase, &mut state.time, input, cv),

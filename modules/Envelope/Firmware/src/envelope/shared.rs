@@ -2,6 +2,9 @@ use core::marker::ConstParamTy;
 use core::sync::atomic::{AtomicBool, Ordering};
 use fixed::{types::extra::U16, FixedU16};
 
+use crate::exponential_curves::{exp_curve, exp_curve_inverse};
+use crate::settings::Curve;
+
 /// When set, every stage takes 10x longer (up to 100 s instead of 10 s)
 static LONG_TIME_RANGE: AtomicBool = AtomicBool::new(false);
 
@@ -121,4 +124,27 @@ pub fn lerp(x: u16, min: u16, max: u16) -> u16 {
     debug_assert!(min <= max);
     let range = max - min;
     ((x as u32 * range as u32) >> 16) as u16 + min
+}
+
+/// Level (0-4095) at phase `t` of a rising stage with the given curve
+pub fn shape(t: u32, curve: Curve) -> u16 {
+    let (c, c_negative) = curve;
+    if c == 0 {
+        // linear; skip the curve math
+        (t >> 20) as u16
+    } else {
+        exp_curve(FixedU16::<U16>::from_bits((t >> 16) as u16), c, c_negative)
+    }
+}
+
+/// Phase at which a rising stage with the given curve is at `level` (0-4095), so a
+/// stage can restart from the current output without a jump
+pub fn shape_inverse(level: u16, curve: Curve) -> u32 {
+    let (c, c_negative) = curve;
+    if c == 0 {
+        (level as u32) << 20
+    } else {
+        let level_frac = FixedU16::<U16>::from_bits(level << 4);
+        (exp_curve_inverse(level_frac, c, c_negative).to_bits() as u32) << 16
+    }
 }

@@ -66,6 +66,17 @@ fn option_index(position: u16, n: u16) -> usize {
     (position as u32 * n as u32 / (MAX_ADC_VALUE as u32 + 1)) as usize
 }
 
+/// A curve for `exp_curve`: (amount, bends the other way)
+pub type Curve = (FixedU16<U16>, bool);
+
+/// The settings the envelope modes use, in the form they need
+#[derive(Copy, Clone)]
+pub struct EnvelopeConfig {
+    pub attack_curve: Curve,
+    pub release_curve: Curve,
+    pub gate_behaviour: GateBehaviour,
+}
+
 /// Curves are stored as knob position / 4; the middle of the knob is linear
 const CURVE_CENTER: u16 = MAX_ADC_VALUE / 2;
 const CURVE_DEADZONE: u16 = 16;
@@ -73,7 +84,7 @@ pub const LINEAR_CURVE: u8 = (CURVE_CENTER / 4) as u8;
 
 /// Curve amount for `exp_curve`: (c, c_negative). Exactly zero (linear) around the
 /// middle of the knob so the linear setting is easy to find.
-pub fn curve_amount(stored: u8) -> (FixedU16<U16>, bool) {
+pub fn curve_amount(stored: u8) -> Curve {
     let position = stored as u16 * 4;
     let (distance, negative) = if position >= CURVE_CENTER {
         (position - CURVE_CENTER, false)
@@ -170,6 +181,14 @@ impl Settings {
         }
         settings.aux_mode = AUX_MODES.get(bytes[5] as usize).copied();
         settings
+    }
+
+    pub fn envelope_config(&self) -> EnvelopeConfig {
+        EnvelopeConfig {
+            attack_curve: curve_amount(self.attack_curve),
+            release_curve: curve_amount(self.release_curve),
+            gate_behaviour: self.gate_behaviour,
+        }
     }
 
     /// Sets the hidden setting assigned to `knob` from that knob's raw reading

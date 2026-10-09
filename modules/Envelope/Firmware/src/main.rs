@@ -266,6 +266,7 @@ fn main() -> ! {
     let mut saved_bytes = eeprom_data;
     save_settings(&mut eeprom, &settings, &mut saved_bytes);
     set_long_time_range(settings.long_range);
+    let mut config = settings.envelope_config();
     let mut envelope_state = EnvelopeState {
         mode: EnvelopeMode::from_index(settings.mode),
         time: 0,
@@ -297,10 +298,60 @@ fn main() -> ! {
     let mut pickup = Pickup::new();
     let mut button_down_time: u32 = 0;
     let mut last_edited_knob: usize = 0;
+    let mut last_edit_cv = [0u16; 4];
     // the LEDs show a hidden setting or a time range preview while the button is held
     let mut showing_edit = false;
 
+    // knob values as the envelope sees them, updated by the UI work below
+    let mut cv = interrupt::free(|cs| GLOBAL_ASYNC_ADC_STATE.get_inner(cs).get_all());
+
     loop {
+        if !DAC_WRITE_QUEUED.atomic_read() {
+            let gate_is_high = gate_pin.is_low();
+            let gate = match (gate_was_high, gate_is_high) {
+                (true, true) => GateState::High,
+                (true, false) => GateState::Falling,
+                (false, true) => GateState::Rising,
+                (false, false) => GateState::Low,
+            };
+            gate_was_high = gate_is_high;
+            let trigger = interrupt::free(|cs| {
+                let mutex = QUEUED_TRIGGER.borrow(cs);
+                let value = mutex.get();
+                mutex.set(false);
+                value
+            });
+            let input = Input { gate, trigger };
+            #[cfg(feature = "profile")]
+            set_profile_pin(true);
+            let (value, did_change_phase) = update(&mut envelope_state, &input, &cv, &config);
+            #[cfg(feature = "profile")]
+            set_profile_pin(false);
+            dac.write_keep_cs_pin_low(&mut spi, DacChannel::ChannelA, value, &Default::default());
+            unsafe_access_mutex(|cs| DAC_WRITE_QUEUED.borrow(cs).set(true));
+
+            if did_change_phase || aux.pulsing() || showing_edit {
+                let aux_mode = settings.aux_mode.unwrap_or(jumper_aux);
+                aux_output_pin
+                    .set_state(aux.update(aux_flags(&envelope_state.mode), aux_mode).into())
+                    .unwrap_infallible();
+            }
+            if did_change_phase && display == DisplayMode::ShowEnvelopeSegment && !showing_edit {
+                ui.update(ui_show_stage(&envelope_state.mode));
+            }
+        }
+
+
+        // The rest of the loop (knobs, button, LEDs) takes up to ~150 us. Only start
+        // it if it will finish before the next sample is due, so it can never delay
+        // computing one; it runs in whatever time the envelope math leaves over.
+        if DAC_WRITE_QUEUED.atomic_read() && dp.TC2.tcnt2.read().bits() > SAMPLE_TICKS - UI_MAX_TICKS
+        {
+            continue;
+        }
+
+        #[cfg(feature = "profile")]
+        set_ui_profile_pin(true);
         let raw_cv = interrupt::free(|cs| GLOBAL_ASYNC_ADC_STATE.get_inner(cs).get_all());
         let current_time = sys_clock.millis_exact();
 
@@ -315,9 +366,14 @@ fn main() -> ! {
             | LongPressButtonState::ButtonJustClickedLong) => {
                 let held_ms = current_time.wrapping_sub(button_down_time);
                 if let Some(knob) = editor.hold(held_ms, &raw_cv) {
-                    settings.set_from_knob(knob, &raw_cv);
-                    last_edited_knob = knob;
-                    ui.update(settings.leds(knob, jumper_aux));
+                    // only when the knob moved, to keep this pass short
+                    if knob != last_edited_knob || raw_cv != last_edit_cv {
+                        settings.set_from_knob(knob, &raw_cv);
+                        config = settings.envelope_config();
+                        ui.update(settings.leds(knob, jumper_aux));
+                        last_edited_knob = knob;
+                        last_edit_cv = raw_cv;
+                    }
                     showing_edit = true;
                 } else if state == LongPressButtonState::ButtonJustClickedLong {
                     // releasing now will toggle the range; preview the new one
@@ -367,40 +423,11 @@ fn main() -> ! {
         }
 
         // knobs being used for (or just used for) a hidden setting keep their old value
-        let mut cv = raw_cv;
+        cv = raw_cv;
         editor.freeze(&mut cv);
         pickup.apply(&mut cv);
-
-        if !DAC_WRITE_QUEUED.atomic_read() {
-            let gate_is_high = gate_pin.is_low();
-            let gate = match (gate_was_high, gate_is_high) {
-                (true, true) => GateState::High,
-                (true, false) => GateState::Falling,
-                (false, true) => GateState::Rising,
-                (false, false) => GateState::Low,
-            };
-            gate_was_high = gate_is_high;
-            let trigger = interrupt::free(|cs| {
-                let mutex = QUEUED_TRIGGER.borrow(cs);
-                let value = mutex.get();
-                mutex.set(false);
-                value
-            });
-            let input = Input { gate, trigger };
-            let (value, did_change_phase) = update(&mut envelope_state, &input, &cv);
-            dac.write_keep_cs_pin_low(&mut spi, DacChannel::ChannelA, value, &Default::default());
-            unsafe_access_mutex(|cs| DAC_WRITE_QUEUED.borrow(cs).set(true));
-
-            if did_change_phase || aux.pulsing() || showing_edit {
-                let aux_mode = settings.aux_mode.unwrap_or(jumper_aux);
-                aux_output_pin
-                    .set_state(aux.update(aux_flags(&envelope_state.mode), aux_mode).into())
-                    .unwrap_infallible();
-            }
-            if did_change_phase && display == DisplayMode::ShowEnvelopeSegment && !showing_edit {
-                ui.update(ui_show_stage(&envelope_state.mode));
-            }
-        }
+        #[cfg(feature = "profile")]
+        set_ui_profile_pin(false);
 
         #[cfg(feature = "debug")]
         {
@@ -431,6 +458,28 @@ fn save_settings(
     }
 }
 
+/// A0 is high during the UI part of the main loop (with the `profile` feature)
+#[cfg(feature = "profile")]
+fn set_ui_profile_pin(high: bool) {
+    let dp = unsafe { arduino_hal::Peripherals::steal() };
+    dp.PORTC.ddrc.modify(|r, w| unsafe { w.bits(r.bits() | 0b1) });
+    dp.PORTC.portc.modify(|r, w| unsafe { w.bits(if high { r.bits() | 0b1 } else { r.bits() & !0b1 }) });
+}
+
+/// D9 is high while the envelope math runs (with the `profile` feature)
+#[cfg(feature = "profile")]
+fn set_profile_pin(high: bool) {
+    let dp = unsafe { arduino_hal::Peripherals::steal() };
+    dp.PORTB.ddrb.modify(|r, w| unsafe { w.bits(r.bits() | 0b10) });
+    dp.PORTB.portb.modify(|r, w| unsafe { w.bits(if high { r.bits() | 0b10 } else { r.bits() & !0b10 }) });
+}
+
+/// TIMER2 counts 4 us ticks from one sample to the next (0..SAMPLE_TICKS)
+const SAMPLE_TICKS: u8 = 120;
+/// Time the UI part of the main loop is given, in TIMER2 ticks. Measured in simavr: it
+/// usually takes ~110 us, up to ~280 us on the rare pass that applies a setting edit
+const UI_MAX_TICKS: u8 = 50;
+
 fn configure_timer(tc2: &arduino_hal::pac::TC2) {
     // reset timer counter at TOP set by OCRA
     tc2.tccr2a.write(|w| w.wgm2().ctc());
@@ -438,7 +487,7 @@ fn configure_timer(tc2: &arduino_hal::pac::TC2) {
     // timing in envelope/shared.rs relies on
     // (16MHz clock speed / 64 prescale factor / 120 counts; the counter goes 0..=OCR2A)
     tc2.tccr2b.write(|w| w.cs2().prescale_64());
-    tc2.ocr2a.write(|w| w.bits(119));
+    tc2.ocr2a.write(|w| w.bits(SAMPLE_TICKS - 1));
 
     // enable interrupt on match to compare register A
     tc2.timsk2.write(|w| w.ocie2a().set_bit());

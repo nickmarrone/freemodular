@@ -1,6 +1,6 @@
 // Runs the envelope firmware in simavr and logs:
 //   dac.log      every DAC channel A sample: "<cycle> <value 0-4095>"
-//   io.log       LED (0-3) and aux (X) output changes: "<cycle> <pin> <level>"
+//   io.log       LED (0-3), aux (X) and profile pins (P: envelope math, U: UI) changes: "<cycle> <pin> <level>"
 //   compute.log  per sample, cycles from the DAC latch until the firmware starts
 //                writing the next sample, i.e. how long computing it took
 //
@@ -91,6 +91,10 @@ int main(int argc, char **argv) {
     for (int i = 4; i < 8; i++)
         avr_irq_register_notify(avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ('D'), i), io_cb, (void *)(long)('0' + i - 4));
     avr_irq_register_notify(avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ('C'), 3), io_cb, (void *)(long)'X');
+    // D9: high while the firmware computes a sample (with the `profile` feature)
+    avr_irq_register_notify(avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ('B'), 1), io_cb, (void *)(long)'P');
+    // A0: high during the UI part of the main loop (with the `profile` feature)
+    avr_irq_register_notify(avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ('C'), 0), io_cb, (void *)(long)'U');
     // Knob i is read from ADC4..ADC7. The firmware sets ADMUX two conversions ahead
     // because real hardware only applies it when the next conversion starts, but
     // simavr applies it at once, so in the simulator every reading lands one slot
