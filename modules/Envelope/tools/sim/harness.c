@@ -91,7 +91,11 @@ int main(int argc, char **argv) {
     for (int i = 4; i < 8; i++)
         avr_irq_register_notify(avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ('D'), i), io_cb, (void *)(long)('0' + i - 4));
     avr_irq_register_notify(avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ('C'), 3), io_cb, (void *)(long)'X');
-    static const int adc_ch[4] = {ADC_IRQ_ADC4, ADC_IRQ_ADC5, ADC_IRQ_ADC6, ADC_IRQ_ADC7};
+    // Knob i is read from ADC4..ADC7. The firmware sets ADMUX two conversions ahead
+    // because real hardware only applies it when the next conversion starts, but
+    // simavr applies it at once, so in the simulator every reading lands one slot
+    // early. Feed each knob's voltage to the next channel to compensate.
+    static const int adc_ch[4] = {ADC_IRQ_ADC5, ADC_IRQ_ADC6, ADC_IRQ_ADC7, ADC_IRQ_ADC4};
     // inputs are inverted in hardware: gate/trig/button active low; CV reads 977 at minimum
     uint64_t trig_release = 0;
     set_pin('D', 2, 1); set_pin('D', 3, 1); set_pin('B', 0, 1);

@@ -1,106 +1,97 @@
 use crate::envelope::{AcrcLoopState, AcrcState, AdsrState, AhrdState, EnvelopeMode};
+use crate::settings::AuxMode;
 
-#[derive(Clone, Copy)]
-pub enum AuxMode {
-    EndOfRise,
-    EndOfFall,
-    NonZero,
-    FollowGate,
+/// What the aux output can show about the current stage, for each aux mode
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AuxFlags {
+    pub end_of_rise: bool,
+    pub end_of_fall: bool,
+    pub non_zero: bool,
+    pub gate: bool,
 }
 
-pub fn update_aux(env_mode: &EnvelopeMode, config: &AuxMode) -> bool {
-    match config {
-        AuxMode::EndOfRise => match env_mode {
-            EnvelopeMode::Adsr(phase) => match phase {
-                AdsrState::Wait => false,
-                AdsrState::Attack => false,
-                AdsrState::Decay => true,
-                AdsrState::Sustain => true,
-                AdsrState::Release => true,
-            },
-            EnvelopeMode::Acrc(phase) => match phase {
-                AcrcState::Wait => false,
-                AcrcState::Attack => false,
-                AcrcState::Hold => true,
-                AcrcState::Release => true,
-            },
-            EnvelopeMode::AcrcLoop(phase) => match phase {
-                AcrcLoopState::Attack => false,
-                AcrcLoopState::Release => true,
-            },
-            EnvelopeMode::AhrdLoop(phase) => match phase {
-                AhrdState::Attack => false,
-                AhrdState::Hold => true,
-                AhrdState::Release => true,
-                AhrdState::Delay => false,
-            },
+const fn flags(end_of_rise: bool, end_of_fall: bool, non_zero: bool, gate: bool) -> AuxFlags {
+    AuxFlags {
+        end_of_rise,
+        end_of_fall,
+        non_zero,
+        gate,
+    }
+}
+
+pub fn aux_flags(env_mode: &EnvelopeMode) -> AuxFlags {
+    match env_mode {
+        EnvelopeMode::Adsr(phase) => match phase {
+            AdsrState::Wait => flags(false, true, false, false),
+            AdsrState::Attack => flags(false, false, true, true),
+            AdsrState::Decay | AdsrState::Sustain => flags(true, false, true, true),
+            AdsrState::Release => flags(true, false, true, false),
         },
-        AuxMode::EndOfFall => match env_mode {
-            EnvelopeMode::Adsr(phase) => match phase {
-                AdsrState::Wait => true,
-                AdsrState::Attack => false,
-                AdsrState::Decay => false,
-                AdsrState::Sustain => false,
-                AdsrState::Release => false,
-            },
-            EnvelopeMode::Acrc(phase) => match phase {
-                AcrcState::Wait => true,
-                AcrcState::Attack => false,
-                AcrcState::Hold => false,
-                AcrcState::Release => false,
-            },
-            EnvelopeMode::AcrcLoop(phase) => match phase {
-                AcrcLoopState::Attack => true,
-                AcrcLoopState::Release => false,
-            },
-            EnvelopeMode::AhrdLoop(phase) => match phase {
-                AhrdState::Attack => false,
-                AhrdState::Hold => false,
-                AhrdState::Release => false,
-                AhrdState::Delay => true,
-            },
+        EnvelopeMode::Acrc(phase) => match phase {
+            AcrcState::Wait => flags(false, true, false, false),
+            AcrcState::Attack => flags(false, false, true, true),
+            AcrcState::Hold => flags(true, false, true, true),
+            AcrcState::Release => flags(true, false, true, false),
         },
-        AuxMode::NonZero => match env_mode {
-            EnvelopeMode::Adsr(phase) => match phase {
-                AdsrState::Wait => false,
-                AdsrState::Attack => true,
-                AdsrState::Decay => true,
-                AdsrState::Sustain => true,
-                AdsrState::Release => true,
-            },
-            EnvelopeMode::Acrc(phase) => match phase {
-                AcrcState::Wait => false,
-                AcrcState::Attack => true,
-                AcrcState::Hold => true,
-                AcrcState::Release => true,
-            },
-            EnvelopeMode::AcrcLoop(phase) => match phase {
-                AcrcLoopState::Attack => true,
-                AcrcLoopState::Release => true,
-            },
-            EnvelopeMode::AhrdLoop(phase) => match phase {
-                AhrdState::Attack => true,
-                AhrdState::Hold => true,
-                AhrdState::Release => true,
-                AhrdState::Delay => false,
-            },
+        EnvelopeMode::AcrcLoop(phase) => match phase {
+            AcrcLoopState::Attack => flags(false, true, true, false),
+            AcrcLoopState::Release => flags(true, false, true, false),
         },
-        AuxMode::FollowGate => match env_mode {
-            EnvelopeMode::Adsr(phase) => match phase {
-                AdsrState::Wait => false,
-                AdsrState::Attack => true,
-                AdsrState::Decay => true,
-                AdsrState::Sustain => true,
-                AdsrState::Release => false,
-            },
-            EnvelopeMode::Acrc(phase) => match phase {
-                AcrcState::Wait => false,
-                AcrcState::Attack => true,
-                AcrcState::Hold => true,
-                AcrcState::Release => false,
-            },
-            EnvelopeMode::AcrcLoop(_) => false,
-            EnvelopeMode::AhrdLoop(_) => false,
+        EnvelopeMode::AhrdLoop(phase) => match phase {
+            AhrdState::Attack => flags(false, false, true, false),
+            AhrdState::Hold | AhrdState::Release => flags(true, false, true, false),
+            AhrdState::Delay => flags(false, true, false, false),
         },
+    }
+}
+
+/// About 5 ms (one less sample than this is high)
+const PULSE_SAMPLES: u8 = 11;
+
+pub struct AuxOutput {
+    previous: AuxFlags,
+    pulse_remaining: u8,
+}
+
+impl AuxOutput {
+    pub const fn new() -> Self {
+        Self {
+            // no pulse for flags that are already set at startup
+            previous: flags(true, true, true, true),
+            pulse_remaining: 0,
+        }
+    }
+
+    /// Whether a pulse is being output, so `update` must be called every sample
+    pub fn pulsing(&self) -> bool {
+        self.pulse_remaining > 0
+    }
+
+    /// Call whenever the stage changes and every sample while `pulsing`. Returns the
+    /// aux output level.
+    pub fn update(&mut self, flags: AuxFlags, mode: AuxMode) -> bool {
+        let rose = |now: bool, before: bool| now && !before;
+        let level = match mode {
+            AuxMode::EndOfRise => flags.end_of_rise,
+            AuxMode::EndOfFall => flags.end_of_fall,
+            AuxMode::NonZero => flags.non_zero,
+            AuxMode::FollowGate => flags.gate,
+            AuxMode::EndOfRisePulse | AuxMode::EndOfFallPulse => {
+                let edge = if mode == AuxMode::EndOfRisePulse {
+                    rose(flags.end_of_rise, self.previous.end_of_rise)
+                } else {
+                    rose(flags.end_of_fall, self.previous.end_of_fall)
+                };
+                if edge {
+                    self.pulse_remaining = PULSE_SAMPLES;
+                }
+                // the call that counts down to 0 turns the output off, so it can't be
+                // left on once `pulsing` stops returning true
+                self.pulse_remaining = self.pulse_remaining.saturating_sub(1);
+                self.pulse_remaining > 0
+            }
+        };
+        self.previous = flags;
+        level
     }
 }

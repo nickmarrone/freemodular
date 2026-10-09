@@ -44,7 +44,9 @@ rustflags = ["-Zlocation-detail=line"]
 panic = "abort"
 codegen-units = 1
 lto = true
-opt-level = 3
+# "s" is about 40% smaller than 3 with the same worst-case compute time per sample
+# (measured in simavr); the firmware no longer fits in flash at 3
+opt-level = "s"
 debug = false
 strip = "symbols"
 overflow-checks = false

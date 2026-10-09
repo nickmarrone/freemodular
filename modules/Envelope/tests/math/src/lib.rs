@@ -2,6 +2,11 @@
 pub mod exponential_curves;
 #[path = "../../../../../fm-lib/src/ringbuffer.rs"]
 pub mod ringbuffer;
+#[path = "../../../Firmware/src/settings.rs"]
+pub mod settings;
+
+#[cfg(test)]
+mod settings_tests;
 
 #[cfg(test)]
 mod tests {

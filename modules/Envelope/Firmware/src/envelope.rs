@@ -11,6 +11,7 @@ pub use self::acrc::{AcrcLoopState, AcrcState};
 pub use self::adsr::AdsrState;
 pub use self::ahrd::AhrdState;
 pub use self::shared::set_long_time_range;
+use crate::settings::led;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum GateState {
@@ -40,14 +41,40 @@ pub enum EnvelopeMode {
     AhrdLoop(AhrdState),
 }
 
-pub const fn ui_show_mode(state: &EnvelopeMode) -> u8 {
-    match state {
-        EnvelopeMode::Adsr(_) => 0b1000 as u8,
-        EnvelopeMode::Acrc(_) => 0b0100,
-        EnvelopeMode::AcrcLoop(_) => 0b0010,
-        EnvelopeMode::AhrdLoop(_) => 0b0001,
+impl EnvelopeMode {
+    pub const COUNT: u8 = 4;
+
+    pub const fn index(&self) -> u8 {
+        match self {
+            EnvelopeMode::Adsr(_) => 0,
+            EnvelopeMode::Acrc(_) => 1,
+            EnvelopeMode::AcrcLoop(_) => 2,
+            EnvelopeMode::AhrdLoop(_) => 3,
+        }
     }
-    .reverse_bits()
+
+    pub fn from_index(index: u8) -> Self {
+        match index {
+            1 => EnvelopeMode::Acrc(AcrcState::default()),
+            2 => EnvelopeMode::AcrcLoop(AcrcLoopState::default()),
+            3 => EnvelopeMode::AhrdLoop(AhrdState::default()),
+            _ => EnvelopeMode::Adsr(AdsrState::default()),
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        Self::from_index((self.index() + 1) % Self::COUNT)
+    }
+}
+
+/// Modes 1-4 light one LED; modes 5-8 light all but one
+pub const fn ui_show_mode(state: &EnvelopeMode) -> u8 {
+    let index = state.index();
+    if index < 4 {
+        led(index)
+    } else {
+        !led(index - 4) & 0xF0
+    }
 }
 
 pub const fn ui_show_stage(state: &EnvelopeMode) -> u8 {

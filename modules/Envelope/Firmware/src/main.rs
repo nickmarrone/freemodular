@@ -18,10 +18,7 @@ use arduino_hal::port::Pin;
 use arduino_hal::{hal::port::PB0, prelude::*, Peripherals};
 use avr_device::interrupt::{self, Mutex};
 use embedded_hal::digital::v2::OutputPin;
-use envelope::{
-    ui_show_mode, ui_show_stage, update, AcrcLoopState, AcrcState, AdsrState, AhrdState,
-    EnvelopeMode,
-};
+use envelope::{ui_show_mode, ui_show_stage, update, EnvelopeMode};
 use fm_lib::{
     async_adc::{
         handle_conversion_result, init_async_adc, new_async_adc_state, AsyncAdc, GetAdcValues,
@@ -36,12 +33,14 @@ use fm_lib::{
 };
 use ufmt::uwriteln;
 
-use crate::aux::{update_aux, AuxMode};
+use crate::aux::{aux_flags, AuxOutput};
 use crate::envelope::{set_long_time_range, EnvelopeState, GateState, Input};
+use crate::settings::{AuxMode, Editor, Pickup, Settings, SAVED_SIZE};
 
 mod aux;
 mod envelope;
 mod exponential_curves;
+mod settings;
 
 static SYSTEM_CLOCK_STATE: GlobalSystemClockState<{ ClockPrecision::MS16 }> =
     GlobalSystemClockState::new();
@@ -62,23 +61,6 @@ fn ui_show_time_range(long: bool) -> u8 {
         0xF0
     } else {
         0x90
-    }
-}
-
-/// The saved byte holds the mode in the low bits and the time range in the top bit
-const SAVED_LONG_RANGE_BIT: u8 = 0x80;
-
-fn saved_byte(mode: &EnvelopeMode, long_range: bool) -> u8 {
-    let mode = match mode {
-        EnvelopeMode::Adsr(_) => 0,
-        EnvelopeMode::Acrc(_) => 1,
-        EnvelopeMode::AcrcLoop(_) => 2,
-        EnvelopeMode::AhrdLoop(_) => 3,
-    };
-    if long_range {
-        mode | SAVED_LONG_RANGE_BIT
-    } else {
-        mode
     }
 }
 
@@ -171,17 +153,6 @@ fn ADC() {
     handle_conversion_result(&GLOBAL_ASYNC_ADC_STATE);
 }
 
-impl EnvelopeMode {
-    fn next(self) -> Self {
-        match self {
-            EnvelopeMode::Adsr(_) => EnvelopeMode::Acrc(AcrcState::default()),
-            EnvelopeMode::Acrc(_) => EnvelopeMode::AcrcLoop(AcrcLoopState::default()),
-            EnvelopeMode::AcrcLoop(_) => EnvelopeMode::AhrdLoop(AhrdState::default()),
-            EnvelopeMode::AhrdLoop(_) => EnvelopeMode::Adsr(AdsrState::default()),
-        }
-    }
-}
-
 impl EnvelopeState {
     fn cycle_mode(self) -> Self {
         Self {
@@ -252,7 +223,8 @@ fn main() -> ! {
         pins.d7.into_output(),
     );
 
-    let config = match (config_pin_1.is_high(), config_pin_2.is_high()) {
+    // the jumpers choose the aux mode until one is set from the panel
+    let jumper_aux = match (config_pin_1.is_high(), config_pin_2.is_high()) {
         (true, true) => AuxMode::EndOfRise,
         (false, true) => AuxMode::EndOfFall,
         (true, false) => AuxMode::NonZero,
@@ -271,34 +243,31 @@ fn main() -> ! {
         }
     }
 
-    let mut eeprom_data = [0u8; 1];
-    let mut eeprom =
-        WearLevelledEepromWriter::<1>::init_and_advance(dp.EEPROM, &mut eeprom_data, erase_eeprom);
+    let mut eeprom_data = Settings::DEFAULT.to_bytes();
+    let mut eeprom = WearLevelledEepromWriter::<SAVED_SIZE>::init_and_advance(
+        dp.EEPROM,
+        &mut eeprom_data,
+        erase_eeprom,
+    );
     ui.update(0);
 
     while btn_pin.is_low() {
         unsafe { asm!("nop") };
     }
 
-    // short click: next mode; hold: toggle time range
+    // short click: next mode; hold: toggle time range; hold and turn a knob: hidden
+    // settings
     let mut button = ButtonWithLongPress::<PB0, 32, 1000>::new(btn_pin);
 
     let sys_clock = SystemClock::init_system_clock(dp.TC0, &SYSTEM_CLOCK_STATE);
 
-    let mut long_range = eeprom_data[0] & SAVED_LONG_RANGE_BIT != 0;
-    set_long_time_range(long_range);
+    let mut settings = Settings::from_bytes(&eeprom_data, EnvelopeMode::COUNT);
+    // older saves (and invalid values) are rewritten in the current format
+    let mut saved_bytes = eeprom_data;
+    save_settings(&mut eeprom, &settings, &mut saved_bytes);
+    set_long_time_range(settings.long_range);
     let mut envelope_state = EnvelopeState {
-        mode: match eeprom_data[0] & !SAVED_LONG_RANGE_BIT {
-            0 => EnvelopeMode::Adsr(AdsrState::default()),
-            1 => EnvelopeMode::Acrc(AcrcState::default()),
-            2 => EnvelopeMode::AcrcLoop(AcrcLoopState::default()),
-            3 => EnvelopeMode::AhrdLoop(AhrdState::default()),
-            _x => {
-                #[cfg(feature = "debug")]
-                uwriteln!(&mut serial, "Unexpected EEPROM value {}", _x).unwrap_infallible();
-                EnvelopeMode::Adsr(AdsrState::default())
-            }
-        },
+        mode: EnvelopeMode::from_index(settings.mode),
         time: 0,
         last_value: 0,
         artificial_gate: false,
@@ -316,6 +285,7 @@ fn main() -> ! {
     dac.shutdown_channel(&mut spi, DacChannel::ChannelB);
 
     let mut aux_output_pin = pins.a3.into_output();
+    let mut aux = AuxOutput::new();
 
     const LED_BLINK_INTERVAL_MS: u32 = 100;
     let mut led_blink_timer: u32 = 0;
@@ -323,22 +293,56 @@ fn main() -> ! {
 
     let mut gate_was_high = false;
 
-    loop {
-        let cv = interrupt::free(|cs| GLOBAL_ASYNC_ADC_STATE.get_inner(cs).get_all());
+    let mut editor = Editor::new();
+    let mut pickup = Pickup::new();
+    let mut button_down_time: u32 = 0;
+    let mut last_edited_knob: usize = 0;
+    // the LEDs show a hidden setting or a time range preview while the button is held
+    let mut showing_edit = false;
 
+    loop {
+        let raw_cv = interrupt::free(|cs| GLOBAL_ASYNC_ADC_STATE.get_inner(cs).get_all());
         let current_time = sys_clock.millis_exact();
-        let new_blink = match button.sample(current_time) {
-            LongPressButtonState::ButtonJustClickedShort => {
-                envelope_state = envelope_state.cycle_mode();
-                Some(ui_show_mode(&envelope_state.mode))
+
+        let mut new_blink = None;
+        match button.sample(current_time) {
+            LongPressButtonState::ButtonJustDown => {
+                editor.press();
+                button_down_time = current_time;
             }
-            LongPressButtonState::ButtonJustClickedLong => {
-                long_range = !long_range;
-                set_long_time_range(long_range);
-                Some(ui_show_time_range(long_range))
+            state @ (LongPressButtonState::ButtonHeldDownShort
+            | LongPressButtonState::ButtonHeldDownLong
+            | LongPressButtonState::ButtonJustClickedLong) => {
+                let held_ms = current_time.wrapping_sub(button_down_time);
+                if let Some(knob) = editor.hold(held_ms, &raw_cv) {
+                    settings.set_from_knob(knob, &raw_cv);
+                    last_edited_knob = knob;
+                    ui.update(settings.leds(knob, jumper_aux));
+                    showing_edit = true;
+                } else if state == LongPressButtonState::ButtonJustClickedLong {
+                    // releasing now will toggle the range; preview the new one
+                    ui.update(ui_show_time_range(!settings.long_range));
+                    showing_edit = true;
+                }
             }
-            _ => None,
-        };
+            state @ (LongPressButtonState::ButtonJustClickedShort
+            | LongPressButtonState::ButtonJustReleasedLong) => {
+                showing_edit = false;
+                new_blink = Some(if editor.release(&raw_cv, &mut pickup) {
+                    settings.leds(last_edited_knob, jumper_aux)
+                } else if state == LongPressButtonState::ButtonJustClickedShort {
+                    envelope_state = envelope_state.cycle_mode();
+                    settings.mode = envelope_state.mode.index();
+                    ui_show_mode(&envelope_state.mode)
+                } else {
+                    settings.long_range = !settings.long_range;
+                    set_long_time_range(settings.long_range);
+                    ui_show_time_range(settings.long_range)
+                });
+                save_settings(&mut eeprom, &settings, &mut saved_bytes);
+            }
+            LongPressButtonState::ButtonIsUp => {}
+        }
 
         if let Some(pattern) = new_blink {
             display = DisplayMode::Blink {
@@ -348,10 +352,9 @@ fn main() -> ! {
             led_blink_timer = current_time.wrapping_add(LED_BLINK_INTERVAL_MS);
             led_blink_state = true;
             ui.update(pattern);
-            eeprom.update_byte(0, saved_byte(&envelope_state.mode, long_range));
         }
 
-        if let DisplayMode::Blink { pattern, until } = display {
+        if let (DisplayMode::Blink { pattern, until }, false) = (display, showing_edit) {
             // wrapping comparisons so the ~49 day millis rollover is harmless
             if (current_time.wrapping_sub(until) as i32) > 0 {
                 display = DisplayMode::ShowEnvelopeSegment;
@@ -362,6 +365,11 @@ fn main() -> ! {
                 ui.update(if led_blink_state { pattern } else { 0 });
             }
         }
+
+        // knobs being used for (or just used for) a hidden setting keep their old value
+        let mut cv = raw_cv;
+        editor.freeze(&mut cv);
+        pickup.apply(&mut cv);
 
         if !DAC_WRITE_QUEUED.atomic_read() {
             let gate_is_high = gate_pin.is_low();
@@ -383,13 +391,14 @@ fn main() -> ! {
             dac.write_keep_cs_pin_low(&mut spi, DacChannel::ChannelA, value, &Default::default());
             unsafe_access_mutex(|cs| DAC_WRITE_QUEUED.borrow(cs).set(true));
 
-            if did_change_phase {
+            if did_change_phase || aux.pulsing() || showing_edit {
+                let aux_mode = settings.aux_mode.unwrap_or(jumper_aux);
                 aux_output_pin
-                    .set_state(update_aux(&envelope_state.mode, &config).into())
+                    .set_state(aux.update(aux_flags(&envelope_state.mode), aux_mode).into())
                     .unwrap_infallible();
-                if display == DisplayMode::ShowEnvelopeSegment {
-                    ui.update(ui_show_stage(&envelope_state.mode));
-                }
+            }
+            if did_change_phase && display == DisplayMode::ShowEnvelopeSegment && !showing_edit {
+                ui.update(ui_show_stage(&envelope_state.mode));
             }
         }
 
@@ -403,6 +412,21 @@ fn main() -> ! {
                     uwrite!(&mut serial, ".").unwrap_infallible();
                 }
             }
+        }
+    }
+}
+
+/// Writes the bytes of `settings` that differ from what was last saved
+fn save_settings(
+    eeprom: &mut WearLevelledEepromWriter<SAVED_SIZE>,
+    settings: &Settings,
+    saved: &mut [u8; SAVED_SIZE],
+) {
+    let bytes = settings.to_bytes();
+    for i in 0..SAVED_SIZE {
+        if bytes[i] != saved[i] {
+            eeprom.update_byte(i as u16, bytes[i]);
+            saved[i] = bytes[i];
         }
     }
 }

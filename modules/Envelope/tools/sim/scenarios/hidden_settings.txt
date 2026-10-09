@@ -1,0 +1,25 @@
+# ADSR with the default (jumper) aux mode: end of rise
+300 gate_on
+800 gate_off
+# hold the button and turn knob 4 up: aux becomes an end-of-fall pulse
+1500 btn_down
+1900 cv 3 1000
+2100 btn_up
+# release knob (4) is frozen at its old value, so this release is unchanged
+2500 gate_on
+3000 gate_off
+# turning it back through the old value (300) picks it up; then a short release
+4000 cv 3 300
+4200 cv 3 50
+5000 gate_on
+5500 gate_off
+# short click: next mode (ACRC)
+6000 btn_down
+6100 btn_up
+# long press with no knob movement: long time range
+6500 btn_down
+7700 btn_up
+# hold and turn knob 3 fully up: gate behaviour = cycle
+8000 btn_down
+8400 cv 2 1000
+8600 btn_up
