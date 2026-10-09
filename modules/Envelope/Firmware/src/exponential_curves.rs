@@ -64,6 +64,11 @@ fn exp2_lut(x: FixedU16<U16>) -> FixedU32<U16> {
     FixedU32::<U16>::from_bits(v_low + (step >> 8) * remainder + (((step & 0xff) * remainder) >> 8))
 }
 
+/// 2^16x in 16.16 fixed point, for 0 <= x < 1
+pub fn exp2_16x(x: FixedU16<U16>) -> FixedU32<U16> {
+    exp2_lut(x)
+}
+
 /**
 Computes the equation (2^(16xc) - 1) / (2^16c - 1)
 - x and c are both positive fractions (0 <= x < 1)

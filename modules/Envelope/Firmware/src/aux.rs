@@ -1,4 +1,7 @@
-use crate::envelope::{AcrcLoopState, AcrcState, AdsrState, AhrdState, EnvelopeMode};
+use crate::envelope::{
+    AcrcLoopState, AcrcState, AdsrState, AhrdState, BallPhase, BurstPhase, EnvelopeMode,
+    RandomPhase, SlewPhase,
+};
 use crate::settings::AuxMode;
 
 /// What the aux output can show about the current stage, for each aux mode
@@ -41,6 +44,30 @@ pub fn aux_flags(env_mode: &EnvelopeMode) -> AuxFlags {
             AhrdState::Attack => flags(false, false, true, false),
             AhrdState::Hold | AhrdState::Release => flags(true, false, true, false),
             AhrdState::Delay => flags(false, true, false, false),
+        },
+        // rising counts as the gate; settled counts as the end of both stages
+        EnvelopeMode::Slew(s) => match s.phase {
+            SlewPhase::Idle => flags(true, true, false, false),
+            SlewPhase::Rising => flags(false, false, true, true),
+            SlewPhase::Falling => flags(true, false, true, false),
+            SlewPhase::Settled => flags(true, true, true, false),
+        },
+        // the end of each pulse's fall is an end of fall, so pulses can be counted
+        EnvelopeMode::Burst(s) => match s.phase {
+            BurstPhase::Idle => flags(false, true, false, false),
+            BurstPhase::Rise => flags(false, s.pulse > 0, true, true),
+            BurstPhase::Fall => flags(true, false, true, false),
+        },
+        EnvelopeMode::RandomLoop(s) => match s.phase {
+            RandomPhase::Rise => flags(false, true, true, false),
+            RandomPhase::Fall => flags(true, false, true, false),
+        },
+        // each impact is an end of fall
+        EnvelopeMode::Ball(s) => match s.phase {
+            BallPhase::Rest => flags(false, true, false, false),
+            BallPhase::Lift | BallPhase::Held => flags(false, false, true, true),
+            BallPhase::Down => flags(true, false, true, false),
+            BallPhase::Up => flags(false, true, true, false),
         },
     }
 }

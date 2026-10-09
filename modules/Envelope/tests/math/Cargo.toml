@@ -1,6 +1,6 @@
-# Host-side unit tests for the envelope's curve math and the shared EEPROM ring
-# buffer search. The firmware only builds for AVR, so the hardware-independent
-# source files are pulled in directly.
+# Host-side unit tests for the envelope modes, settings, curve math and the shared
+# EEPROM ring buffer search. The firmware only builds for AVR, so the hardware-
+# independent source files are pulled in directly.
 #
 #   cd modules/Envelope/tests/math && cargo test
 [package]

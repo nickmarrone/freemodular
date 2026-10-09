@@ -1,0 +1,48 @@
+# aux: end-of-fall pulse (hold, turn knob 4 up, release, turn it back to pick it up)
+600 btn_down
+900 cv 3 1000
+1100 btn_up
+1200 cv 3 300
+# four clicks: ADSR -> AR -> AR loop -> AHRD loop -> slew
+1400 btn_down
+1450 btn_up
+1600 btn_down
+1650 btn_up
+1800 btn_down
+1850 btn_up
+2000 btn_down
+2050 btn_up
+# slew: input up, then down; gate holds it; trig drops it to zero
+2300 cv 0 900
+3600 cv 0 100
+5000 gate_on
+5200 cv 0 800
+5600 gate_off
+6500 trig
+# burst: short pulses, 5 per burst, growing
+7500 btn_down
+7550 btn_up
+7800 cv 0 50
+8000 trig
+# shrinking
+9000 cv 2 200
+9200 trig
+# gate repeats bursts
+10000 gate_on
+10800 gate_off
+# random loop
+11500 btn_down
+11550 btn_up
+13000 gate_on
+13400 gate_off
+# bouncing ball: 0.6 s drop, bouncy, parabolic, full height
+14000 btn_down
+14050 btn_up
+14300 cv 0 250
+14300 cv 1 800
+14300 cv 2 500
+14300 cv 3 1000
+14500 trig
+# lift with the gate, then drop
+17500 gate_on
+18500 gate_off

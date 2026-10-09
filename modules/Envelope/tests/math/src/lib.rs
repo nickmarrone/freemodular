@@ -1,10 +1,22 @@
+#![allow(incomplete_features)]
+#![feature(adt_const_params)]
+
 #[path = "../../../Firmware/src/exponential_curves.rs"]
 pub mod exponential_curves;
 #[path = "../../../../../fm-lib/src/ringbuffer.rs"]
 pub mod ringbuffer;
 #[path = "../../../Firmware/src/settings.rs"]
 pub mod settings;
+// an inline module with a directory path, so envelope.rs finds its submodules in
+// envelope/ as it does in the firmware
+#[path = "../../../Firmware/src"]
+pub mod firmware {
+    pub mod envelope;
+}
+pub use firmware::envelope;
 
+#[cfg(test)]
+mod mode_tests;
 #[cfg(test)]
 mod settings_tests;
 
