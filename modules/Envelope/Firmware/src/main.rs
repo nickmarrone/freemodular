@@ -28,7 +28,7 @@ use fm_lib::{
     },
     asynchronous::{assert_interrupts_disabled, unsafe_access_mutex},
     asynchronous::{AtomicRead, Borrowable},
-    button_debouncer::ButtonDebouncer,
+    button_debouncer::{ButtonWithLongPress, LongPressButtonState},
     eeprom::WearLevelledEepromWriter,
     handle_system_clock_interrupt,
     mcp4922::{DacChannel, MCP4922},
@@ -37,7 +37,7 @@ use fm_lib::{
 use ufmt::uwriteln;
 
 use crate::aux::{update_aux, AuxMode};
-use crate::envelope::{EnvelopeState, GateState, Input};
+use crate::envelope::{set_long_time_range, EnvelopeState, GateState, Input};
 
 mod aux;
 mod envelope;
@@ -48,10 +48,38 @@ static SYSTEM_CLOCK_STATE: GlobalSystemClockState<{ ClockPrecision::MS16 }> =
 handle_system_clock_interrupt!(&SYSTEM_CLOCK_STATE);
 
 const UI_SHOW_ENVELOPE_MODE_MS: u32 = 2000;
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum DisplayMode {
-    ShowEnvelopeMode { until: u32 },
+    /// Blink `pattern` on the LEDs until `until`, then go back to showing the stage
+    Blink { pattern: u8, until: u32 },
     ShowEnvelopeSegment,
+}
+
+/// LED pattern shown after toggling the time range: all four LEDs for the long
+/// (100 s) range, the outer two for the normal (10 s) range
+fn ui_show_time_range(long: bool) -> u8 {
+    if long {
+        0xF0
+    } else {
+        0x90
+    }
+}
+
+/// The saved byte holds the mode in the low bits and the time range in the top bit
+const SAVED_LONG_RANGE_BIT: u8 = 0x80;
+
+fn saved_byte(mode: &EnvelopeMode, long_range: bool) -> u8 {
+    let mode = match mode {
+        EnvelopeMode::Adsr(_) => 0,
+        EnvelopeMode::Acrc(_) => 1,
+        EnvelopeMode::AcrcLoop(_) => 2,
+        EnvelopeMode::AhrdLoop(_) => 3,
+    };
+    if long_range {
+        mode | SAVED_LONG_RANGE_BIT
+    } else {
+        mode
+    }
 }
 
 #[inline(never)]
@@ -252,12 +280,15 @@ fn main() -> ! {
         unsafe { asm!("nop") };
     }
 
-    let mut button = ButtonDebouncer::<PB0, 32>::new(btn_pin);
+    // short click: next mode; hold: toggle time range
+    let mut button = ButtonWithLongPress::<PB0, 32, 1000>::new(btn_pin);
 
     let sys_clock = SystemClock::init_system_clock(dp.TC0, &SYSTEM_CLOCK_STATE);
 
+    let mut long_range = eeprom_data[0] & SAVED_LONG_RANGE_BIT != 0;
+    set_long_time_range(long_range);
     let mut envelope_state = EnvelopeState {
-        mode: match eeprom_data[0] {
+        mode: match eeprom_data[0] & !SAVED_LONG_RANGE_BIT {
             0 => EnvelopeMode::Adsr(AdsrState::default()),
             1 => EnvelopeMode::Acrc(AcrcState::default()),
             2 => EnvelopeMode::AcrcLoop(AcrcLoopState::default()),
@@ -273,7 +304,8 @@ fn main() -> ! {
         artificial_gate: false,
     };
 
-    let mut display = DisplayMode::ShowEnvelopeMode {
+    let mut display = DisplayMode::Blink {
+        pattern: ui_show_mode(&envelope_state.mode),
         until: UI_SHOW_ENVELOPE_MODE_MS,
     };
 
@@ -295,45 +327,39 @@ fn main() -> ! {
         let cv = interrupt::free(|cs| GLOBAL_ASYNC_ADC_STATE.get_inner(cs).get_all());
 
         let current_time = sys_clock.millis_exact();
-        let button_state = button.sample(current_time);
-        let button_was_pressed = match button_state {
-            fm_lib::button_debouncer::ButtonState::ButtonJustPressed => true,
-            _ => false,
+        let new_blink = match button.sample(current_time) {
+            LongPressButtonState::ButtonJustClickedShort => {
+                envelope_state = envelope_state.cycle_mode();
+                Some(ui_show_mode(&envelope_state.mode))
+            }
+            LongPressButtonState::ButtonJustClickedLong => {
+                long_range = !long_range;
+                set_long_time_range(long_range);
+                Some(ui_show_time_range(long_range))
+            }
+            _ => None,
         };
 
-        if button_was_pressed {
-            envelope_state = envelope_state.cycle_mode();
-            display = DisplayMode::ShowEnvelopeMode {
-                until: current_time + UI_SHOW_ENVELOPE_MODE_MS,
+        if let Some(pattern) = new_blink {
+            display = DisplayMode::Blink {
+                pattern,
+                until: current_time.wrapping_add(UI_SHOW_ENVELOPE_MODE_MS),
             };
-            led_blink_timer = current_time + LED_BLINK_INTERVAL_MS;
+            led_blink_timer = current_time.wrapping_add(LED_BLINK_INTERVAL_MS);
             led_blink_state = true;
-            ui.update(ui_show_mode(&envelope_state.mode));
-            eeprom.update_byte(
-                0,
-                match envelope_state.mode {
-                    EnvelopeMode::Adsr(_) => 0,
-                    EnvelopeMode::Acrc(_) => 1,
-                    EnvelopeMode::AcrcLoop(_) => 2,
-                    EnvelopeMode::AhrdLoop(_) => 3,
-                },
-            );
+            ui.update(pattern);
+            eeprom.update_byte(0, saved_byte(&envelope_state.mode, long_range));
         }
 
-        if let DisplayMode::ShowEnvelopeMode { until } = display {
-            if current_time > until {
+        if let DisplayMode::Blink { pattern, until } = display {
+            // wrapping comparisons so the ~49 day millis rollover is harmless
+            if (current_time.wrapping_sub(until) as i32) > 0 {
                 display = DisplayMode::ShowEnvelopeSegment;
                 ui.update(ui_show_stage(&envelope_state.mode));
-            }
-
-            if current_time > led_blink_timer {
-                led_blink_timer = current_time + LED_BLINK_INTERVAL_MS;
+            } else if (current_time.wrapping_sub(led_blink_timer) as i32) > 0 {
+                led_blink_timer = current_time.wrapping_add(LED_BLINK_INTERVAL_MS);
                 led_blink_state = !led_blink_state;
-                if led_blink_state {
-                    ui.update(ui_show_mode(&envelope_state.mode));
-                } else {
-                    ui.update(0);
-                }
+                ui.update(if led_blink_state { pattern } else { 0 });
             }
         }
 
@@ -384,10 +410,11 @@ fn main() -> ! {
 fn configure_timer(tc2: &arduino_hal::pac::TC2) {
     // reset timer counter at TOP set by OCRA
     tc2.tccr2a.write(|w| w.wgm2().ctc());
-    // set timer frequency to cycle at ~2.2727kHz
-    // (16MHz clock speed / 64 prescale factor / 120 count/reset )
+    // set timer frequency to 2083.3Hz = one sample every 480us, which the envelope
+    // timing in envelope/shared.rs relies on
+    // (16MHz clock speed / 64 prescale factor / 120 counts; the counter goes 0..=OCR2A)
     tc2.tccr2b.write(|w| w.cs2().prescale_64());
-    tc2.ocr2a.write(|w| w.bits(120));
+    tc2.ocr2a.write(|w| w.bits(119));
 
     // enable interrupt on match to compare register A
     tc2.timsk2.write(|w| w.ocie2a().set_bit());

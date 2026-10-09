@@ -7,7 +7,7 @@
 
 <h1>Envelope</h1>
 
-<p>A simple but powerful envelope generator that can cycle between 4 separate modes: traditional ADSR, AR with tunable curves, and two looping modes.</p>
+<p>A simple but powerful envelope generator that can cycle between 4 separate modes: traditional ADSR, AR with tunable curves, and two looping modes. Hold the mode button to switch to a long time range (up to 100 seconds per stage).</p>
 
 <h2>Resources</h2>
 

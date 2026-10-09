@@ -19,8 +19,13 @@ pub fn adsr(
     last_value: u16,
     input: &Input,
     cv: &[u16; 4],
+    artificial_gate: &mut bool,
 ) -> (u16, bool) {
-    if input.trigger && (*phase == AdsrState::Decay || *phase == AdsrState::Sustain) {
+    if input.trigger && input.gate != GateState::Rising {
+        // Ping: soft-return to the attack stage from the current level. Without a
+        // gate held, the envelope then runs attack -> decay -> release on its own.
+        // (gate falling at the same moment counts as no gate)
+        *artificial_gate = input.gate != GateState::High;
         *time = get_adsr_inverse_attack(last_value);
         *phase = AdsrState::Attack;
         let (value, _) = compute_adsr_value(phase, time, cv);
@@ -28,8 +33,19 @@ pub fn adsr(
     }
 
     match input.gate {
-        GateState::High | GateState::Low => compute_adsr_value(phase, time, cv),
+        GateState::High => compute_adsr_value(phase, time, cv),
+        GateState::Low => {
+            let (value, rollover) = compute_adsr_value(phase, time, cv);
+            if *artificial_gate && *phase == AdsrState::Sustain {
+                // a ping has no gate to hold the sustain stage
+                *artificial_gate = false;
+                *phase = AdsrState::Release;
+                *time = get_adsr_inverse_release(value);
+            }
+            (value, rollover)
+        }
         GateState::Rising => {
+            *artificial_gate = false;
             *time = get_adsr_inverse_attack(last_value);
             *phase = AdsrState::Attack;
             let (value, _) = compute_adsr_value(phase, time, cv);
@@ -66,8 +82,12 @@ fn compute_adsr_value(phase: &mut AdsrState, time: &mut u32, cv: &[u16; 4]) -> (
         AdsrState::Attack => {
             let (t, rollover) = step_time(time, cv[0]);
             if rollover {
-                *phase = AdsrState::Decay;
-                // TODO skip decay if sustain is maxed or decay is 0
+                // with sustain all the way up, decay would just hold the peak
+                *phase = if get_sustain() >= MAX_DAC_VALUE {
+                    AdsrState::Sustain
+                } else {
+                    AdsrState::Decay
+                };
             }
             (scale(t), rollover)
         }

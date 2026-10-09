@@ -144,6 +144,7 @@ pub fn acrc_loop(
     }
 }
 
+#[inline(never)]
 fn acrc_segment(time: &mut u32, raw_cv_len: u16, raw_cv_c: u16, invert: bool) -> (u16, bool) {
     let (t, rollover) = step_time(time, raw_cv_len);
     let (c_fixed, c_negative) = read_cv_signed_fixed(raw_cv_c);

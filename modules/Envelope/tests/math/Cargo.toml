@@ -1,0 +1,13 @@
+# Host-side unit tests for the envelope's curve math and the shared EEPROM ring
+# buffer search. The firmware only builds for AVR, so the hardware-independent
+# source files are pulled in directly.
+#
+#   cd modules/Envelope/tests/math && cargo test
+[package]
+name = "fm-envelope-math-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+fixed = "1.27.0"

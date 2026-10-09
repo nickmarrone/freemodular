@@ -10,6 +10,7 @@ use ahrd::ahrd;
 pub use self::acrc::{AcrcLoopState, AcrcState};
 pub use self::adsr::AdsrState;
 pub use self::ahrd::AhrdState;
+pub use self::shared::set_long_time_range;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum GateState {
@@ -80,9 +81,14 @@ pub const fn ui_show_stage(state: &EnvelopeMode) -> u8 {
 
 pub fn update(state: &mut EnvelopeState, input: &Input, cv: &[u16; 4]) -> (u16, bool) {
     let (value, rollover) = match state.mode {
-        EnvelopeMode::Adsr(ref mut phase) => {
-            adsr(phase, &mut state.time, state.last_value, input, cv)
-        }
+        EnvelopeMode::Adsr(ref mut phase) => adsr(
+            phase,
+            &mut state.time,
+            state.last_value,
+            input,
+            cv,
+            &mut state.artificial_gate,
+        ),
         EnvelopeMode::Acrc(ref mut phase) => acrc(
             phase,
             &mut state.time,

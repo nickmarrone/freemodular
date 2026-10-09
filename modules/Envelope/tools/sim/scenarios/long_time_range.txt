@@ -1,0 +1,8 @@
+300 cv 0 100
+300 cv 2 1000
+2500 gate_on
+3500 gate_off
+4500 btn_down
+6000 btn_up
+7000 gate_on
+12000 gate_off

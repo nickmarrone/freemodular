@@ -1,5 +1,13 @@
-use fixed::{types::extra::U16, FixedU16};
 use core::marker::ConstParamTy;
+use core::sync::atomic::{AtomicBool, Ordering};
+use fixed::{types::extra::U16, FixedU16};
+
+/// When set, every stage takes 10x longer (up to 100 s instead of 10 s)
+static LONG_TIME_RANGE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_long_time_range(long: bool) {
+    LONG_TIME_RANGE.store(long, Ordering::Relaxed);
+}
 
 #[derive(Copy, Clone)]
 pub struct Fraction<T> {
@@ -74,12 +82,17 @@ pub fn read_cv_signed_fixed(cv: u16) -> (FixedU16<U16>, bool) {
 fn get_delta_t(cv: u16) -> u32 {
     // 10 seconds
     const MAX_PHASE_TIME_MICROS: u32 = 10 * 1000 * 1000;
-    // ~2.27kHz == .48 ms / period
+    // must match the DAC update timer in main.rs (2083.3 Hz)
     const MICROS_PER_STEP: u32 = 480;
-    const MAX_STEPS_PER_CYCLE: u16 = (MAX_PHASE_TIME_MICROS / MICROS_PER_STEP) as u16;
+    const MAX_STEPS_PER_CYCLE: u32 = MAX_PHASE_TIME_MICROS / MICROS_PER_STEP;
     let cv_fraction = read_cv::<{ CvType::Exponential }>(cv);
-    let mut actual_steps_per_cycle = (cv_fraction.numerator as u32 * MAX_STEPS_PER_CYCLE as u32)
-        / cv_fraction.denominator as u32;
+    let max_steps = if LONG_TIME_RANGE.load(Ordering::Relaxed) {
+        MAX_STEPS_PER_CYCLE * 10
+    } else {
+        MAX_STEPS_PER_CYCLE
+    };
+    let mut actual_steps_per_cycle =
+        (cv_fraction.numerator as u32 * max_steps) / cv_fraction.denominator as u32;
     if actual_steps_per_cycle == 0 {
         actual_steps_per_cycle = 1;
     }

@@ -1,38 +1,67 @@
-use avr_progmem::{progmem, wrapper::ProgMem};
 use fixed::{types::extra::U16, FixedU16, FixedU32};
-
-progmem! {
-    pub static progmem EXP_LUT: [u8; LUT_SIZE * U32_BYTES] = *include_bytes!("../exp2lut.bin");
-    pub static progmem LOG_LUT: [u8; LUT_SIZE * U16_BYTES] = *include_bytes!("../log2lut.bin");
-}
 
 const LUT_SIZE: usize = 256;
 const U32_BYTES: usize = u32::BITS as usize / 8;
 const U16_BYTES: usize = u16::BITS as usize / 8;
 
-fn lut_load_fixed32(i: usize, lut: &ProgMem<[u8; LUT_SIZE * U32_BYTES]>) -> FixedU32<U16> {
-    debug_assert!(i < lut.len() / U32_BYTES);
-    let bytes: [u8; U32_BYTES] = lut.load_sub_array::<U32_BYTES>(U32_BYTES * i);
-    FixedU32::<U16>::from_le_bytes(bytes)
+#[cfg(target_arch = "avr")]
+avr_progmem::progmem! {
+    static progmem EXP_LUT: [u8; LUT_SIZE * U32_BYTES] = *include_bytes!("../exp2lut.bin");
+    static progmem LOG_LUT: [u8; LUT_SIZE * U16_BYTES] = *include_bytes!("../log2lut.bin");
 }
 
-fn lut_load_u16(i: usize, lut: &ProgMem<[u8; LUT_SIZE * U16_BYTES]>) -> u16 {
-    debug_assert!(i < lut.len() / U16_BYTES);
-    let bytes: [u8; U16_BYTES] = lut.load_sub_array::<U16_BYTES>(U16_BYTES * i);
-    u16::from_le_bytes(bytes)
+#[cfg(target_arch = "avr")]
+fn exp_lut_bytes(i: usize) -> [u8; U32_BYTES] {
+    EXP_LUT.load_sub_array::<U32_BYTES>(U32_BYTES * i)
+}
+
+#[cfg(target_arch = "avr")]
+fn log_lut_bytes(i: usize) -> [u8; U16_BYTES] {
+    LOG_LUT.load_sub_array::<U16_BYTES>(U16_BYTES * i)
+}
+
+// On the host (unit tests) the tables are plain arrays
+#[cfg(not(target_arch = "avr"))]
+static EXP_LUT: [u8; LUT_SIZE * U32_BYTES] = *include_bytes!("../exp2lut.bin");
+#[cfg(not(target_arch = "avr"))]
+static LOG_LUT: [u8; LUT_SIZE * U16_BYTES] = *include_bytes!("../log2lut.bin");
+
+#[cfg(not(target_arch = "avr"))]
+fn exp_lut_bytes(i: usize) -> [u8; U32_BYTES] {
+    EXP_LUT[U32_BYTES * i..U32_BYTES * (i + 1)].try_into().unwrap()
+}
+
+#[cfg(not(target_arch = "avr"))]
+fn log_lut_bytes(i: usize) -> [u8; U16_BYTES] {
+    LOG_LUT[U16_BYTES * i..U16_BYTES * (i + 1)].try_into().unwrap()
+}
+
+fn lut_load_fixed32(i: usize) -> FixedU32<U16> {
+    debug_assert!(i < LUT_SIZE);
+    FixedU32::<U16>::from_le_bytes(exp_lut_bytes(i))
+}
+
+fn lut_load_u16(i: usize) -> u16 {
+    debug_assert!(i < LUT_SIZE);
+    u16::from_le_bytes(log_lut_bytes(i))
 }
 
 /**
 Returns 2^16x by finding the two nearest entries in the lookup table and
 interpolating between them.
+
+The interpolation is done in plain u32 math: a fixed-point `lerp` would need a
+64-bit multiply, which is very slow on AVR. The step between entries is split into
+high and low bytes so the products fit in 32 bits.
 */
 fn exp2_lut(x: FixedU16<U16>) -> FixedU32<U16> {
-    let idx_low = x.to_bits() >> 8;
-    let idx_high = u16::min(255, idx_low + 1);
-    let remainder = FixedU32::<U16>::from_bits((x.to_bits() << 8) as u32);
-    let v_low = lut_load_fixed32(idx_low as usize, &EXP_LUT);
-    let v_high = lut_load_fixed32(idx_high as usize, &EXP_LUT);
-    remainder.lerp(v_low, v_high)
+    let idx_low = (x.to_bits() >> 8) as usize;
+    let idx_high = usize::min(LUT_SIZE - 1, idx_low + 1);
+    let remainder = (x.to_bits() & 0xff) as u32;
+    let v_low = lut_load_fixed32(idx_low).to_bits();
+    let v_high = lut_load_fixed32(idx_high).to_bits();
+    let step = v_high - v_low;
+    FixedU32::<U16>::from_bits(v_low + (step >> 8) * remainder + (((step & 0xff) * remainder) >> 8))
 }
 
 /**
@@ -41,34 +70,42 @@ Computes the equation (2^(16xc) - 1) / (2^16c - 1)
 - c_negative indicates whether c should be interpreted as a negative number,
 which will cause the curve to bend the other direction
 - returns a number between 0 and 4095 (0xFFF) inclusive
+
+This runs for every sample in the curved modes, so it avoids 64-bit math (which
+the fixed-point division and reciprocal need, and which is very slow on AVR):
+- the negative curve is the positive one rotated 180 degrees, f(-c, x) = 1 - f(c, 1 - x),
+  so no reciprocals are needed
+- the ratio is computed with one 32-bit division after scaling both terms down
 */
+#[inline(never)]
 pub fn exp_curve(x: FixedU16<U16>, c: FixedU16<U16>, c_negative: bool) -> u16 {
-    let a = exp2_lut(x * c);
-    let b = exp2_lut(c);
-    const ONE: FixedU32<U16> = FixedU32::<U16>::from_bits(1u32 << 16);
-    const SCALE_FACTOR: u16 = 4096;
-    debug_assert!(a >= ONE);
-    debug_assert!(b >= ONE);
-    let (numerator, denominator) = if c_negative {
-        // ((a - ONE).saturating_mul(b), (b - ONE).saturating_mul(a))
-        (ONE - a.recip(), ONE - b.recip())
+    if c_negative {
+        let flipped = FixedU16::<U16>::from_bits(u16::MAX - x.to_bits());
+        MAX_OUTPUT - exp_curve_positive(flipped, c)
     } else {
-        (a - ONE, b - ONE)
-    };
-    if denominator.is_zero() {
-        const SCALE_FACTOR_FIXED: FixedU32<U16> =
-            FixedU32::<U16>::from_bits((SCALE_FACTOR as u32) << 16);
-        let result = (Into::<FixedU32<U16>>::into(x) * SCALE_FACTOR_FIXED).to_num::<u16>();
-        debug_assert!(result < SCALE_FACTOR);
-        return result;
+        exp_curve_positive(x, c)
     }
-    debug_assert!(numerator <= denominator);
-    if numerator == denominator {
-        return SCALE_FACTOR - 1;
+}
+
+const MAX_OUTPUT: u16 = 4095;
+
+fn exp_curve_positive(x: FixedU16<U16>, c: FixedU16<U16>) -> u16 {
+    const ONE: u32 = 1 << 16;
+    let a = exp2_lut(x * c).to_bits();
+    let b = exp2_lut(c).to_bits();
+    debug_assert!(a >= ONE && b >= ONE && a <= b);
+    let mut numerator = a - ONE;
+    let mut denominator = b - ONE;
+    if denominator == 0 {
+        // c == 0: linear
+        return ((x.to_bits() as u32 * (MAX_OUTPUT as u32 + 1)) >> 16) as u16;
     }
-    let result = ((numerator / denominator) * SCALE_FACTOR as u32).to_num::<u16>();
-    debug_assert!(result < SCALE_FACTOR);
-    return result;
+    // keep numerator * 4096 within u32
+    while denominator >= 1 << 20 {
+        numerator >>= 1;
+        denominator >>= 1;
+    }
+    u32::min(numerator * (MAX_OUTPUT as u32 + 1) / denominator, MAX_OUTPUT as u32) as u16
 }
 
 /**
@@ -102,15 +139,21 @@ pub fn fixed_point_log2(mut x: FixedU32<U16>) -> FixedU32<U16> {
     // Shift x to the left to normalize it (i.e. make the MSB 1)
     let normalized = x.to_bits() << lz;
 
-    // Get the most significant 8 bits of the normalized number to use as LUT index
+    // The 8 bits after the leading 1 index the table of log2(1 + i/256); the next
+    // 8 bits interpolate between entries. Without interpolation, values just
+    // above 1 (gentle curves) all round down to log2 = 0.
     let fractional_part_index = ((normalized >> 23) & 0xFF) as usize;
-    debug_assert!(fractional_part_index <= 255);
-
-    // Lookup the fractional part from the table
-    let fractional_part = lut_load_u16(fractional_part_index, &LOG_LUT) as u32;
+    let remainder = (normalized >> 15) & 0xFF;
+    let low = lut_load_u16(fractional_part_index) as u32;
+    let high = if fractional_part_index == 255 {
+        1 << 16 // log2(2)
+    } else {
+        lut_load_u16(fractional_part_index + 1) as u32
+    };
+    let fractional_part = low + (((high - low) * remainder) >> 8);
 
     // Combine the integer part and the fractional part
-    FixedU32::<U16>::from_bits((integer_part << 16) | fractional_part)
+    FixedU32::<U16>::from_bits((integer_part << 16) + fractional_part)
 }
 
 /**
@@ -119,30 +162,33 @@ Calculates the inverse of the exp_curve function s.t. exp_curve_inverse(exp_curv
 The formula is log2(x * (2^c - 1) + 1) / c
 */
 pub fn exp_curve_inverse(x: FixedU16<U16>, c: FixedU16<U16>, c_negative: bool) -> FixedU16<U16> {
+    if c_negative {
+        // Same symmetry as exp_curve: f(-c)^-1(y) = 1 - f(c)^-1(1 - y). This avoids
+        // reciprocals and logs of values below 1, which lose a lot of precision.
+        let flipped = FixedU16::<U16>::from_bits(u16::MAX - x.to_bits());
+        let t = exp_curve_inverse_positive(flipped, c);
+        FixedU16::<U16>::from_bits(u16::MAX - t.to_bits())
+    } else {
+        exp_curve_inverse_positive(x, c)
+    }
+}
+
+fn exp_curve_inverse_positive(x: FixedU16<U16>, c: FixedU16<U16>) -> FixedU16<U16> {
     if c == 0 {
-        return FixedU16::<U16>::from_bits(x.to_bits() >> 4);
+        // linear
+        return x;
     }
 
     const ONE: FixedU32<U16> = FixedU32::<U16>::from_bits(1u32 << 16);
 
-    // if c is negative, the output will always work out to be positive
-    // because log2(a) will be < 0, and so will the denominator
-    // To keep things simple, we just ignore the +/- sign.
-    // To calculate A for negative c, use identity 2^(-x) = 1/(2^x)
-    // and rearrange terms to avoid subtraction underflow
-    let a = if c_negative {
-        let coefficient = ONE - exp2_lut(c).recip();
-        ONE - (Into::<FixedU32<U16>>::into(x) * coefficient)
-    } else {
-        let coefficient = exp2_lut(c) - ONE;
-        (Into::<FixedU32<U16>>::into(x) * coefficient) + ONE
-    };
+    let coefficient = exp2_lut(c) - ONE;
+    let a = (Into::<FixedU32<U16>>::into(x) * coefficient) + ONE;
 
     let numerator = fixed_point_log2(a);
     let denominator = FixedU32::<U16>::from(c) * 16;
-
-    debug_assert!(numerator <= denominator);
     debug_assert!(denominator != 0);
 
-    FixedU16::<U16>::from_bits((numerator / denominator).to_bits() as u16)
+    // Table rounding can push the ratio slightly past 1; clamp instead of wrapping
+    // around to 0 (which would restart the stage from the bottom)
+    FixedU16::<U16>::from_bits(u32::min((numerator / denominator).to_bits(), u16::MAX as u32) as u16)
 }

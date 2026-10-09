@@ -1,0 +1,14 @@
+500 gate_on
+1500 gate_off
+2500 trig
+3500 btn_down
+3600 btn_up
+4000 gate_on
+4600 gate_off
+5500 trig
+6500 btn_down
+6600 btn_up
+9000 btn_down
+9100 btn_up
+11000 btn_down
+11100 btn_up
