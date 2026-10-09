@@ -1,3 +1,4 @@
+use crate::clock::{is_special_division, ClockConfig};
 use crate::random::Rng;
 
 pub enum MenuOrScreenSaverState {
@@ -12,11 +13,21 @@ pub struct ScreenSaverState {
     pub rng: Rng,
 }
 
-#[repr(packed)]
+pub struct TapState {
+    pub last_tap_ms: u32,
+    pub intervals: [u16; 4],
+    pub num_intervals: u8,
+    pub next: u8,
+}
+
 pub struct MenuState {
     pub page: MenuPage,
     pub editing: EditingState,
     pub last_input_time_ms: u32,
+    pub last_turn_time_ms: u32,
+    /// preset slot selected on the global page
+    pub slot: u8,
+    pub tap: TapState,
 }
 
 impl MenuOrScreenSaverState {
@@ -31,53 +42,58 @@ impl MenuState {
             page: MenuPage::Bpm,
             editing: EditingState::Navigating,
             last_input_time_ms: time,
+            last_turn_time_ms: time,
+            slot: 0,
+            tap: TapState {
+                last_tap_ms: 0,
+                intervals: [0; 4],
+                num_intervals: 0,
+                next: 0,
+            },
         }
     }
 }
 
 impl ScreenSaverState {
     pub fn new(seed: u32) -> Self {
-        let rng = Rng::new(seed);
-        let y_offsets = [0u8; 16];
-        // for i in 0..16 {
-        //     y_offsets[i] = rng.next() % 8;
-        // }
         Self {
-            y_offsets,
+            y_offsets: [0u8; 16],
             color: true,
-            rng,
+            rng: Rng::new(seed),
         }
     }
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum EditingState {
-    Editing,
     Navigating,
+    Editing,
+    /// BPM page only: editing tenths of a BPM
+    EditingFine,
+    /// BPM page only: encoder clicks are tempo taps
+    Tap,
 }
 
 impl EditingState {
     pub fn toggle(&self) -> Self {
         match self {
-            EditingState::Editing => EditingState::Navigating,
             EditingState::Navigating => EditingState::Editing,
+            _ => EditingState::Navigating,
         }
     }
-}
 
-impl Into<bool> for EditingState {
-    fn into(self) -> bool {
-        match self {
-            EditingState::Editing => true,
-            EditingState::Navigating => false,
-        }
+    pub fn is_editing(&self) -> bool {
+        *self != EditingState::Navigating
     }
 }
 
 pub enum MenuPage {
+    /// Module-wide settings, above the BPM page
+    Global { cursor: u8, scroll: u8 },
     Bpm,
     Main { cursor: u8 },
     SubMenu { cursor: u8, scroll: u8, channel: u8 },
+    ConfirmReset,
 }
 
 #[derive(PartialEq, Eq)]
@@ -86,41 +102,68 @@ pub enum MenuUpdate {
     UpdateValueAtCursor,
     ToggleEditingAtCursor,
     MoveCursorFrom(u8),
-    Scroll(ScrollDirection),
+    Scroll,
     SwitchScreens,
     ScreenSaverStep(u8),
 }
 
-#[derive(PartialEq, Eq)]
-pub enum ScrollDirection {
-    Up,
-    Down,
-}
-
+/// Rows of the scrolling list pages (channel detail page and global page)
 #[derive(PartialEq, Eq, Clone, Copy)]
-pub enum SubMenuItem {
+#[repr(u8)]
+#[allow(dead_code)] // constructed by transmute
+pub enum MenuItem {
     Division = 0,
-    PulseWidth = 1,
-    PhaseShift = 2,
-    Swing = 3,
-    Exit = 4,
+    Tuplet,
+    PulseWidth,
+    PhaseShift,
+    Swing,
+    Probability,
+    EuclidSteps,
+    EuclidFill,
+    EuclidRotate,
+    Exit,
+    StopMode,
+    Load,
+    Save,
 }
 
-impl Into<u8> for SubMenuItem {
-    fn into(self) -> u8 {
-        self as u8
+const NUM_CHANNEL_ITEMS: u8 = MenuItem::Exit as u8 + 1;
+const NUM_GLOBAL_ITEMS: u8 = 3;
+
+impl MenuItem {
+    fn from_u8(value: u8) -> Self {
+        debug_assert!(value <= MenuItem::Save as u8);
+        unsafe { core::mem::transmute(value) }
     }
 }
 
-impl From<u8> for SubMenuItem {
-    fn from(value: u8) -> Self {
-        match value {
-            const { Self::Division as u8 } => Self::Division,
-            const { Self::PulseWidth as u8 } => Self::PulseWidth,
-            const { Self::PhaseShift as u8 } => Self::PhaseShift,
-            const { Self::Swing as u8 } => Self::Swing,
-            const { Self::Exit as u8 } => Self::Exit,
-            _ => panic!(),
+impl MenuPage {
+    /// Number of rows in a list page
+    pub fn list_len(&self, config: &ClockConfig) -> u8 {
+        match *self {
+            MenuPage::Global { .. } => NUM_GLOBAL_ITEMS,
+            MenuPage::SubMenu { channel, .. } => {
+                if is_special_division(config.channels[channel as usize].division) {
+                    2
+                } else {
+                    NUM_CHANNEL_ITEMS
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn list_item(&self, index: u8, config: &ClockConfig) -> MenuItem {
+        match *self {
+            MenuPage::Global { .. } => MenuItem::from_u8(MenuItem::StopMode as u8 + index),
+            _ => {
+                if self.list_len(config) == 2 && index == 1 {
+                    // special channels only have a tempo setting
+                    MenuItem::Exit
+                } else {
+                    MenuItem::from_u8(index)
+                }
+            }
         }
     }
 }

@@ -1,8 +1,7 @@
 use embedded_graphics::pixelcolor::BinaryColor;
-use fm_lib::debug_unwrap::DebugUnwrap;
 
 use crate::{
-    clock::ClockConfig,
+    clock::{ClockChannelConfig, ClockConfig},
     display_buffer::{Justify, MiniBuffer, TextColor},
     font::PRO_FONT_22,
     menu::{menu_state::EditingState, MenuUpdate},
@@ -24,10 +23,10 @@ pub fn render_main_page<DI, SIZE>(
         MenuUpdate::UpdateValueAtCursor | MenuUpdate::ToggleEditingAtCursor => {
             draw_top_level_menu_item(
                 cursor,
-                clock_state.channels[cursor as usize].division,
+                &clock_state.channels[cursor as usize],
                 match editing {
                     EditingState::Editing => ChannelStyle::Editing,
-                    EditingState::Navigating => ChannelStyle::Selected,
+                    _ => ChannelStyle::Selected,
                 },
                 display,
             )
@@ -42,7 +41,7 @@ pub fn render_main_page<DI, SIZE>(
                 ] {
                     draw_top_level_menu_item(
                         index,
-                        clock_state.channels[index as usize].division,
+                        &clock_state.channels[index as usize],
                         style,
                         display,
                     )
@@ -51,7 +50,7 @@ pub fn render_main_page<DI, SIZE>(
                 full_render_main_page(editing, clock_state, cursor, display);
             }
         }
-        MenuUpdate::SwitchScreens | MenuUpdate::Scroll(_) => {
+        MenuUpdate::SwitchScreens | MenuUpdate::Scroll => {
             full_render_main_page(editing, clock_state, cursor, display);
         }
         MenuUpdate::NoUpdate | MenuUpdate::ScreenSaverStep(_) => (),
@@ -81,14 +80,14 @@ fn full_render_main_page<DI, SIZE>(
         let style = if channel_idx == cursor {
             match editing {
                 EditingState::Editing => ChannelStyle::Editing,
-                EditingState::Navigating => ChannelStyle::Selected,
+                _ => ChannelStyle::Selected,
             }
         } else {
             ChannelStyle::Deselected
         };
         draw_top_level_menu_item(
             channel_idx,
-            clock_state.channels[channel_idx as usize].division,
+            &clock_state.channels[channel_idx as usize],
             style,
             display,
         )
@@ -98,7 +97,7 @@ fn full_render_main_page<DI, SIZE>(
 #[inline(never)]
 fn draw_top_level_menu_item<DI, SIZE>(
     channel_index: u8,
-    value: i8,
+    channel: &ClockChannelConfig,
     state: ChannelStyle,
     display: &mut ssd1306::Ssd1306<DI, SIZE, ssd1306::mode::BasicMode>,
 ) where
@@ -111,8 +110,8 @@ fn draw_top_level_menu_item<DI, SIZE>(
     let screen_x = x * 64;
     let screen_y = y * 32;
 
-    let mut buffer: [u8; 4] = [0u8; 4];
-    let text = tempo_to_str(&mut buffer, value);
+    let mut buffer = [0u8; 5];
+    let text = tempo_to_str(&mut buffer, channel.division, channel.tuplet);
 
     let mut mini_buffer = MiniBuffer::<64, 32>::new();
 
@@ -148,5 +147,5 @@ fn draw_top_level_menu_item<DI, SIZE>(
             2,
         );
     }
-    mini_buffer.blit(display, screen_x, screen_y).assert_ok();
+    let _ = mini_buffer.blit(display, screen_x, screen_y);
 }

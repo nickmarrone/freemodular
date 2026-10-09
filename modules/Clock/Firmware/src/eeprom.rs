@@ -1,203 +1,206 @@
-use core::mem::{self, offset_of};
+use core::mem;
 
-use arduino_hal::Eeprom;
-use avr_device::atmega328p::EEPROM;
-use fm_lib::debug_unwrap::DebugUnwrap;
+use avr_device::{atmega328p::EEPROM, interrupt};
 
-use crate::{
-    clock::{ClockChannelConfig, ClockConfig},
-    menu::{MAX_BPM, MIN_BPM},
-};
+use crate::clock::ClockConfig;
 
-struct EepromWrite {
-    offset: u8,
-    value: u8,
-}
+/*
+EEPROM layout:
 
-/**
-On module startup, the previous clock config is loaded from EEPROM, if it was saved.
-Then, the whole config is copied to another spot in EEPROM in order to spread out
-the writes since each EEPROM bit can only take a limited number of writes in its
-lifetime. All subsequent changes to clock state are written to the new location.
+```text
+0 ............................. PRESET_BASE ........................ 1024
+| wear-levelled live config blocks | preset slot 0 | ... | preset slot 7 |
+```
 
-To save writes and clock cycles, updates are not written to EEPROM immediately.
-Instead, one update at a time can be queued. Queue is flushed after a short delay
-or when a change to a different field is queued.
+On startup, the latest live config block is loaded and then copied to the next block,
+spreading writes out over the wear-levelled area since each EEPROM cell only survives
+a limited number of writes. Each block is `[MAGIC, version, config...]`. The header is
+written *after* the data so a block that was only partially written is never chosen.
 
-This is very similar to `WearLevelledEepromWriter` in `fm-lib`, but because both
-flash storage and memory are *very* constrained in this module, this is a slightly
-simplified and specialized version to address only the needs of this module.
+All writes skip bytes that already hold the right value, so saving the whole config
+after an edit only actually writes the byte(s) that changed.
+
+This talks to the EEPROM registers directly instead of using the avr-hal driver: it
+is much smaller, and it disables interrupts for the timed EEMPE -> EEPE sequence,
+which the clock interrupt would otherwise be able to break.
 */
+
+const CONFIG_SIZE: u16 = mem::size_of::<ClockConfig>() as u16;
+const CAPACITY: u16 = 1024;
+pub const NUM_PRESETS: u8 = 8;
+const PRESET_BASE: u16 = CAPACITY - NUM_PRESETS as u16 * CONFIG_SIZE;
+const BLOCK_SIZE: u16 = CONFIG_SIZE + 2;
+const NUM_BLOCKS: u16 = PRESET_BASE / BLOCK_SIZE;
+/// Identifies blocks written by this firmware/format version. Bump when the config
+/// layout changes so old data is ignored instead of misinterpreted.
+const MAGIC: u8 = 0xC2;
+
+fn regs() -> &'static avr_device::atmega328p::eeprom::RegisterBlock {
+    unsafe { &*EEPROM::ptr() }
+}
+
+fn read_byte(addr: u16) -> u8 {
+    let ee = regs();
+    while ee.eecr.read().eepe().bit_is_set() {}
+    ee.eear.write(|w| w.bits(addr));
+    ee.eecr.write(|w| w.eere().set_bit());
+    ee.eedr.read().bits()
+}
+
+fn write_byte(addr: u16, value: u8) {
+    if read_byte(addr) == value {
+        return;
+    }
+    let ee = regs();
+    ee.eedr.write(|w| w.bits(value));
+    interrupt::free(|_| {
+        // EEPE must be set within 4 cycles of EEMPE
+        ee.eecr.write(|w| w.eempe().set_bit());
+        ee.eecr.write(|w| w.eempe().set_bit().eepe().set_bit());
+    });
+}
+
+fn as_bytes(config: &ClockConfig) -> &[u8; CONFIG_SIZE as usize] {
+    unsafe { mem::transmute(config) }
+}
+
+#[inline(never)]
+fn write_config(addr: u16, config: &ClockConfig) {
+    for (i, byte) in as_bytes(config).iter().enumerate() {
+        write_byte(addr + i as u16, *byte);
+    }
+}
+
+/// Reads a config into `config` if the stored data is valid. Returns success.
+#[inline(never)]
+fn read_config(addr: u16, config: &mut ClockConfig) -> bool {
+    let mut candidate = ClockConfig::new();
+    let raw: &mut [u8; CONFIG_SIZE as usize] = unsafe { mem::transmute(&mut candidate) };
+    for (i, byte) in raw.iter_mut().enumerate() {
+        *byte = read_byte(addr + i as u16);
+    }
+    if candidate.is_valid() {
+        *config = candidate;
+        true
+    } else {
+        false
+    }
+}
+
+/// Imports settings saved by older firmware, which stored `[version, config]` blocks
+/// of 35 bytes with 4 bytes per channel (division, swing, pulse width, phase) followed
+/// by the BPM. Leaves `config` untouched if nothing valid is found.
+#[inline(never)]
+fn migrate_legacy_config(config: &mut ClockConfig) {
+    const LEGACY_BLOCK_SIZE: u16 = 35;
+    let mut latest: Option<(u16, u8)> = None;
+    let mut addr = 0;
+    while addr + LEGACY_BLOCK_SIZE <= CAPACITY {
+        let version = read_byte(addr);
+        if version != 0xff && latest.map_or(true, |(_, v)| version > v) {
+            latest = Some((addr, version));
+        }
+        addr += LEGACY_BLOCK_SIZE;
+    }
+    if let Some((addr, _)) = latest {
+        let mut legacy = ClockConfig::new();
+        let mut a = addr + 1;
+        for channel in legacy.channels.iter_mut() {
+            channel.division = read_byte(a) as i8;
+            channel.swing = read_byte(a + 1);
+            channel.pulse_width = read_byte(a + 2);
+            channel.phase_shift = read_byte(a + 3) as i8;
+            a += 4;
+        }
+        legacy.bpm10 = read_byte(a) as u16 * 10;
+        if legacy.is_valid() {
+            *config = legacy;
+        }
+    }
+}
+
 pub struct PersistanceManager {
-    eeprom: Eeprom,
+    /// address of the config data in the active block
     offset: u16,
-    queued_write: EepromWrite,
+    dirty: bool,
+    changed_at_ms: u32,
 }
-
-fn is_valid_clock_config(data: &[u8; mem::size_of::<ClockConfig>()]) -> bool {
-    let config: &ClockConfig = unsafe { mem::transmute(data) };
-    if config.bpm < MIN_BPM || config.bpm > MAX_BPM {
-        return false;
-    }
-
-    for channel in &config.channels {
-        if channel.division > 64 || channel.division < -65 {
-            return false;
-        }
-
-        if channel.pulse_width > 100 {
-            return false;
-        }
-
-        if channel.phase_shift > 32 || channel.phase_shift < -32 {
-            return false;
-        }
-
-        if channel.swing > 32 {
-            return false;
-        }
-    }
-
-    true
-}
-
-const NULL_OFFSET: u8 = u8::MAX;
-const UNINITIALIZED: u8 = u8::MAX;
 
 impl PersistanceManager {
+    /// Loads the saved config (or leaves the default if there is none) and claims
+    /// the next wear-levelling block
     #[inline(never)]
-    pub fn new(eeprom: EEPROM, clock_config: &mut ClockConfig) -> Self {
-        let raw_data: &mut [u8; mem::size_of::<ClockConfig>()] =
-            unsafe { mem::transmute(clock_config) };
-        let mut eep = arduino_hal::Eeprom::new(eeprom);
-
-        const BLOCK_SIZE: u16 = mem::size_of::<ClockConfig>() as u16 + 1;
-
-        let mut latest_version: u8 = UNINITIALIZED;
-        let mut latest_version_index: u16 = 0;
-
-        for i in (0..eep.capacity()).step_by(BLOCK_SIZE as usize) {
-            let version = eep.read_byte(i);
-            if version != UNINITIALIZED
-                && (version > latest_version || latest_version == UNINITIALIZED)
-            {
-                latest_version = version;
-                latest_version_index = i;
-            }
-        }
-
-        let mut new_index = 0;
-
-        if latest_version == UNINITIALIZED {
-            eep.write_byte(new_index, 0);
-            eep.write(new_index + 1, raw_data).assert_ok();
-        } else {
-            let mut new_version = latest_version + 1;
-            if new_version == UNINITIALIZED {
-                new_version = 0;
-                for i in (0..eep.capacity()).step_by(BLOCK_SIZE as usize) {
-                    eep.erase_byte(i);
+    pub fn new(clock_config: &mut ClockConfig) -> Self {
+        let mut latest: Option<(u16, u8)> = None;
+        for block in 0..NUM_BLOCKS {
+            let addr = block * BLOCK_SIZE;
+            if read_byte(addr) == MAGIC {
+                let version = read_byte(addr + 1);
+                if latest.map_or(true, |(_, v)| version > v) {
+                    latest = Some((block, version));
                 }
             }
-            new_index = latest_version_index + BLOCK_SIZE;
-            if new_index + BLOCK_SIZE > eep.capacity() {
-                new_index = 0;
-            }
-            eep.read(latest_version_index + 1, raw_data).assert_ok();
-
-            if !is_valid_clock_config(&raw_data) {
-                // If the loaded clock state is invalid (either because of a bug in
-                // this code or because the EEPROM has been corrupted somehow, or
-                // because it was modified before loading this firmware) the config
-                // should be reset to default
-
-                // TODO indicate to user somehow that this has happened
-                *raw_data = unsafe { mem::transmute(ClockConfig::new()) }
-            }
-
-            eep.write_byte(new_index, new_version);
-            eep.write(new_index + 1, raw_data).assert_ok();
         }
+
+        let (block, version) = match latest {
+            Some((block, version)) => {
+                // If the saved config is invalid (corrupted EEPROM, a bug...) the
+                // default config is kept
+                if !read_config(block * BLOCK_SIZE + 2, clock_config) {
+                    migrate_legacy_config(clock_config);
+                }
+                ((block + 1) % NUM_BLOCKS, version.wrapping_add(1))
+            }
+            None => {
+                migrate_legacy_config(clock_config);
+                (0, 0)
+            }
+        };
+        if version == 0 && latest.is_some() {
+            // version counter wrapped: invalidate every block so the new one is latest
+            for b in 0..NUM_BLOCKS {
+                write_byte(b * BLOCK_SIZE, 0xff);
+            }
+        }
+
+        let addr = block * BLOCK_SIZE;
+        write_config(addr + 2, clock_config);
+        write_byte(addr + 1, version);
+        write_byte(addr, MAGIC);
 
         Self {
-            eeprom: eep,
-            offset: new_index + 1,
-            queued_write: EepromWrite {
-                offset: NULL_OFFSET,
-                value: 0,
-            },
+            offset: addr + 2,
+            dirty: false,
+            changed_at_ms: 0,
         }
     }
 
-    pub fn overwrite(&mut self, new_config: &ClockConfig) {
-        let raw_data: &[u8; mem::size_of::<ClockConfig>()] = unsafe { mem::transmute(new_config) };
-        self.eeprom.write(self.offset, raw_data).assert_ok();
-        self.queued_write.offset = NULL_OFFSET;
+    /// Note that the config changed. It will be written after a short delay so a
+    /// burst of edits only costs one write.
+    pub fn mark_dirty(&mut self, now_ms: u32) {
+        self.dirty = true;
+        self.changed_at_ms = now_ms;
     }
 
-    pub fn flush(&mut self) {
-        if self.queued_write.offset != NULL_OFFSET {
-            self.eeprom.write_byte(
-                self.offset + self.queued_write.offset as u16,
-                self.queued_write.value,
-            );
-            self.queued_write.offset = NULL_OFFSET;
+    /// Write pending changes if the config has been stable for a moment
+    pub fn poll(&mut self, config: &ClockConfig, now_ms: u32) {
+        if self.dirty && now_ms.wrapping_sub(self.changed_at_ms) > 1500 {
+            self.save(config);
         }
     }
 
-    #[inline(always)]
-    fn queue_write(&mut self, offset: u8, value: u8) {
-        if self.queued_write.offset != NULL_OFFSET && self.queued_write.offset != offset {
-            self.eeprom.write_byte(
-                self.offset + self.queued_write.offset as u16,
-                self.queued_write.value,
-            );
-        }
-        debug_assert!((offset as usize) < mem::size_of::<ClockConfig>());
-        self.queued_write = EepromWrite { offset, value }
+    #[inline(never)]
+    pub fn save(&mut self, config: &ClockConfig) {
+        write_config(self.offset, config);
+        self.dirty = false;
     }
 
-    fn write_channel_attribute(&mut self, channel: u8, offset: u8, value: u8) {
-        let eeprom_offset = offset_of!(ClockConfig, channels) as u8
-            + (channel * mem::size_of::<ClockChannelConfig>() as u8)
-            + offset;
-        self.queue_write(eeprom_offset, value);
+    pub fn save_preset(&mut self, slot: u8, config: &ClockConfig) {
+        write_config(PRESET_BASE + slot as u16 * CONFIG_SIZE, config);
     }
 
-    #[inline(always)]
-    pub fn set_bpm(&mut self, tempo: u8) {
-        self.queue_write(offset_of!(ClockConfig, bpm) as u8, tempo);
-    }
-
-    #[inline(always)]
-    pub fn set_division(&mut self, channel: u8, division: i8) {
-        self.write_channel_attribute(
-            channel,
-            offset_of!(ClockChannelConfig, division) as u8,
-            unsafe { mem::transmute(division) },
-        );
-    }
-
-    #[inline(always)]
-    pub fn set_pulse_width(&mut self, channel: u8, pw: u8) {
-        self.write_channel_attribute(
-            channel,
-            offset_of!(ClockChannelConfig, pulse_width) as u8,
-            pw,
-        );
-    }
-
-    #[inline(always)]
-    pub fn set_phase_shift(&mut self, channel: u8, ps: i8) {
-        self.write_channel_attribute(
-            channel,
-            offset_of!(ClockChannelConfig, phase_shift) as u8,
-            unsafe { mem::transmute(ps) },
-        );
-    }
-
-    #[inline(always)]
-    pub fn set_swing(&mut self, channel: u8, sw: u8) {
-        self.write_channel_attribute(channel, offset_of!(ClockChannelConfig, swing) as u8, sw);
+    /// Returns false (leaving `config` untouched) if the slot is empty or invalid
+    pub fn load_preset(&mut self, slot: u8, config: &mut ClockConfig) -> bool {
+        read_config(PRESET_BASE + slot as u16 * CONFIG_SIZE, config)
     }
 }

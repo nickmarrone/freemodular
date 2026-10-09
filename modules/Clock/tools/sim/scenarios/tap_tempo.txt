@@ -1,0 +1,10 @@
+500 enc_down
+1200 enc_up
+1500 enc_down
+1580 enc_up
+2000 enc_down
+2080 enc_up
+2500 enc_down
+2580 enc_up
+3000 enc_down
+3080 enc_up

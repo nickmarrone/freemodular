@@ -1,87 +1,86 @@
-use avr_progmem::{progmem, progmem_str as F};
-use embedded_graphics::{pixelcolor::BinaryColor, prelude::DrawTarget};
-use fm_lib::debug_unwrap::DebugUnwrap;
+use avr_progmem::progmem;
+use embedded_graphics::pixelcolor::BinaryColor;
 
 use crate::{
-    clock::ClockChannelConfig,
+    clock::ClockConfig,
     display_buffer::{Justify, MiniBuffer, TextColor},
     font::PRO_FONT_22,
     menu::{
-        menu_state::{EditingState, SubMenuItem},
+        menu_state::{EditingState, MenuItem, MenuPage, MenuState},
         MenuUpdate,
     },
-    render_numbers::{i8_to_str_b10, tempo_to_str, u8_to_str_b10},
+    render_numbers::{
+        i8_to_str_b10, tempo_to_str, u16_to_str_b10, word, CHAR_PERCENT, WORD_INVT, WORD_OFF,
+        WORD_STOP_NOW, WORD_TRIG,
+    },
 };
 
-#[inline(always)]
-pub fn render_submenu_page<DI, SIZE>(
-    cursor: u8,
-    scroll: u8,
-    channel: &ClockChannelConfig,
-    editing: EditingState,
+/// Renders the scrolling list pages: the per-channel detail page and the global page.
+/// Two rows are visible at a time.
+#[inline(never)]
+pub fn render_list_page<DI, SIZE>(
+    menu_state: &MenuState,
+    config: &ClockConfig,
     menu_update: &MenuUpdate,
     display: &mut ssd1306::Ssd1306<DI, SIZE, ssd1306::mode::BasicMode>,
 ) where
     DI: display_interface::WriteOnlyDataCommand,
     SIZE: ssd1306::size::DisplaySize,
 {
+    let (cursor, scroll, channel) = match menu_state.page {
+        MenuPage::SubMenu {
+            cursor,
+            scroll,
+            channel,
+        } => (cursor, scroll, channel),
+        MenuPage::Global { cursor, scroll } => (cursor, scroll, 0),
+        _ => return,
+    };
+    let page = &menu_state.page;
     match menu_update {
         MenuUpdate::UpdateValueAtCursor | MenuUpdate::ToggleEditingAtCursor => {
-            draw_submenu_item(cursor, true, 0, editing.into(), false, channel, display);
+            draw_item_value(
+                row_y(cursor - scroll),
+                true,
+                menu_state.editing,
+                page.list_item(cursor, config),
+                config,
+                channel,
+                menu_state.slot,
+                display,
+            );
         }
-        MenuUpdate::MoveCursorFrom(_) | MenuUpdate::Scroll(_) | MenuUpdate::SwitchScreens => {
-            if channel.division == -65 {
-                let editing_division = match editing {
-                    EditingState::Editing => {
-                        if cursor == 0 {
-                            EditingState::Editing
-                        } else {
-                            EditingState::Navigating
-                        }
-                    }
-                    EditingState::Navigating => EditingState::Navigating,
-                };
-                draw_arrows(true, false, display);
-                draw_arrows(false, false, display);
-                draw_submenu_item(
-                    0,
-                    cursor == 0,
-                    scroll,
-                    editing_division,
-                    true,
+        MenuUpdate::MoveCursorFrom(_) | MenuUpdate::Scroll | MenuUpdate::SwitchScreens => {
+            let len = page.list_len(config);
+            draw_arrows(true, scroll > 0, display);
+            draw_arrows(false, scroll + 2 < len, display);
+            for i in scroll..(scroll + 2).min(len) {
+                let selected = cursor == i;
+                let item = page.list_item(i, config);
+                let y = row_y(i - scroll);
+                draw_item_label(y, selected, item, display);
+                draw_item_value(
+                    y,
+                    selected,
+                    if selected {
+                        menu_state.editing
+                    } else {
+                        EditingState::Navigating
+                    },
+                    item,
+                    config,
                     channel,
+                    menu_state.slot,
                     display,
                 );
-                let exit_y_offset = 24 + 8;
-                draw_submenu_item_label(exit_y_offset, cursor == 4, SubMenuItem::Exit, display);
-                let mut buffer = MiniBuffer::<54, 24>::new();
-                if cursor == 4 {
-                    buffer.clear(BinaryColor::On).assert_ok();
-                }
-                buffer.blit(display, 74, exit_y_offset).assert_ok();
-            } else {
-                let at_top = scroll == 0;
-                let at_bottom = scroll >= 3;
-                draw_arrows(true, !at_top, display);
-                draw_arrows(false, !at_bottom, display);
-                for i in scroll..scroll + 2 {
-                    let selected = cursor == i;
-                    let editing_item = match editing {
-                        EditingState::Editing => {
-                            if selected {
-                                EditingState::Editing
-                            } else {
-                                EditingState::Navigating
-                            }
-                        }
-                        EditingState::Navigating => EditingState::Navigating,
-                    };
-                    draw_submenu_item(i, selected, scroll, editing_item, true, channel, display);
-                }
             }
         }
         MenuUpdate::NoUpdate | MenuUpdate::ScreenSaverStep(_) => {}
     }
+}
+
+fn row_y(row: u8) -> u8 {
+    row * 24 + 8
 }
 
 progmem! {
@@ -113,6 +112,12 @@ progmem! {
     ];
     static progmem RETURN_ARROW: [u8; 57] = *include_bytes!("../../../assets/back_arrow.bin");
     static progmem SLASH_64: [u8; 36] = *include_bytes!("../../../assets/div_64.bin");
+    /// Labels for each MenuItem, in order
+    static progmem LABELS: [[u8; 6]; 13] = [
+        *b"Tempo\0", *b"Tuplet", *b"PulseW", *b"Phase\0", *b"Swing\0", *b"Prob\0\0",
+        *b"Steps\0", *b"Fill\0\0", *b"Rotate", *b"Exit\0\0", *b"Stop\0\0", *b"Load\0\0",
+        *b"Save\0\0",
+    ];
 }
 
 #[inline(never)]
@@ -145,83 +150,88 @@ fn draw_arrows<DI, SIZE>(
         }
     }
 
-    buffer.blit(display, 0, y).assert_ok();
+    let _ = buffer.blit(display, 0, y);
 }
 
-#[inline(always)]
-fn draw_submenu_item<DI, SIZE>(
-    index: u8,
-    selected: bool,
-    scroll: u8,
-    editing: EditingState,
-    full_update: bool,
-    channel: &ClockChannelConfig,
-    display: &mut ssd1306::Ssd1306<DI, SIZE, ssd1306::mode::BasicMode>,
-) where
-    DI: display_interface::WriteOnlyDataCommand,
-    SIZE: ssd1306::size::DisplaySize,
-{
-    let offset_y = (index.saturating_sub(scroll)) * 24 + 8;
-    let menu_item: SubMenuItem = index.into();
-    if full_update {
-        draw_submenu_item_label(offset_y, selected, menu_item, display);
-    }
-    draw_submenu_item_value(offset_y, selected, editing, menu_item, channel, display);
+enum Symbol {
+    None,
+    Percent,
+    SixtyFourths,
 }
 
 #[inline(never)]
-fn draw_submenu_item_value<DI, SIZE>(
+fn draw_item_value<DI, SIZE>(
     y_offset: u8,
     selected: bool,
     editing: EditingState,
-    item: SubMenuItem,
-    channel: &ClockChannelConfig,
+    item: MenuItem,
+    config: &ClockConfig,
+    channel_idx: u8,
+    slot: u8,
     display: &mut ssd1306::Ssd1306<DI, SIZE, ssd1306::mode::BasicMode>,
 ) where
     DI: display_interface::WriteOnlyDataCommand,
     SIZE: ssd1306::size::DisplaySize,
 {
+    let channel = &config.channels[channel_idx as usize];
     let mut buffer = MiniBuffer::<54, 24>::new();
-    let text_color = if selected && !Into::<bool>::into(editing) {
-        buffer.clear(BinaryColor::On).assert_ok();
+    let editing = editing.is_editing();
+    let text_color = if selected && !editing {
+        let _ = buffer.clear(BinaryColor::On);
         TextColor::BinaryOff
     } else {
         TextColor::BinaryOn
     };
-    let mut text_buffer = [0u8; 4];
-    let (text, symbol): (&[u8], Option<[u8; 36]>) = match item {
-        SubMenuItem::Division => (tempo_to_str(&mut text_buffer, channel.division), None),
-        SubMenuItem::PulseWidth => match channel.pulse_width {
-            0 => {
-                text_buffer.copy_from_slice("TRIG".as_bytes());
-                (&text_buffer, None)
-            }
-            100 => {
-                text_buffer.copy_from_slice("INVT".as_bytes());
-                (&text_buffer, None)
-            }
+    let mut text_buffer = [0u8; 5];
+    let mut symbol = Symbol::None;
+    let text: &[u8] = match item {
+        MenuItem::Division => tempo_to_str(&mut text_buffer, channel.division, channel.tuplet),
+        MenuItem::Tuplet => word(&mut text_buffer, WORD_OFF + channel.tuplet),
+        MenuItem::PulseWidth => match channel.pulse_width {
+            0 => word(&mut text_buffer, WORD_TRIG),
+            100 => word(&mut text_buffer, WORD_INVT),
             pulse_width => {
-                let text = u8_to_str_b10(&mut text_buffer, pulse_width);
-                // This could be done by appending '%' to the text buffer but
-                // this is a little easier
-                // Using custom code page to save space, '_' is mapped to '/'
-                (text, Some(PRO_FONT_22.get_glyph(b'^')))
+                symbol = Symbol::Percent;
+                u16_to_str_b10(&mut text_buffer, pulse_width as u16)
             }
         },
-        SubMenuItem::PhaseShift => (
-            i8_to_str_b10(&mut text_buffer, channel.phase_shift),
-            Some(SLASH_64.load()),
-        ),
-        SubMenuItem::Swing => (
-            u8_to_str_b10(&mut text_buffer, channel.swing),
-            Some(SLASH_64.load()),
-        ),
-        SubMenuItem::Exit => (&text_buffer[0..0], None),
+        MenuItem::PhaseShift => {
+            symbol = Symbol::SixtyFourths;
+            i8_to_str_b10(&mut text_buffer, channel.phase_shift)
+        }
+        MenuItem::Swing => {
+            symbol = Symbol::SixtyFourths;
+            u16_to_str_b10(&mut text_buffer, channel.swing as u16)
+        }
+        MenuItem::Probability => {
+            symbol = Symbol::Percent;
+            u16_to_str_b10(&mut text_buffer, channel.probability as u16)
+        }
+        MenuItem::EuclidSteps if channel.euclid_steps == 0 => word(&mut text_buffer, WORD_OFF),
+        MenuItem::EuclidSteps => u16_to_str_b10(&mut text_buffer, channel.euclid_steps as u16),
+        MenuItem::EuclidFill => u16_to_str_b10(&mut text_buffer, channel.euclid_fill as u16),
+        MenuItem::EuclidRotate => u16_to_str_b10(&mut text_buffer, channel.euclid_rotate as u16),
+        MenuItem::StopMode => word(&mut text_buffer, WORD_STOP_NOW + config.stop_mode),
+        MenuItem::Load | MenuItem::Save => u16_to_str_b10(&mut text_buffer, slot as u16 + 1),
+        MenuItem::Exit => &[],
     };
     let mut align_to: u8 = 52;
-    if let Some(img) = symbol {
-        align_to -= 12;
-        buffer.fast_draw_image(align_to as usize, 1, 12, 24, &img, &text_color);
+    match symbol {
+        Symbol::None => {}
+        Symbol::Percent => {
+            align_to -= 12;
+            buffer.fast_draw_ascii_text(
+                Justify::Start(align_to as usize),
+                Justify::Start(1),
+                &[CHAR_PERCENT],
+                &PRO_FONT_22,
+                &text_color,
+            );
+        }
+        Symbol::SixtyFourths => {
+            align_to -= 12;
+            buffer.fast_draw_image(align_to as usize, 1, 12, 24, &SLASH_64.load(), &text_color);
+        }
     }
     buffer.fast_draw_ascii_text(
         Justify::End(align_to as usize),
@@ -230,17 +240,17 @@ fn draw_submenu_item_value<DI, SIZE>(
         &PRO_FONT_22,
         &text_color,
     );
-    if editing == EditingState::Editing {
+    if editing {
         buffer.fast_rect(0, 0, 54, 24, BinaryColor::On, 2);
     }
-    buffer.blit(display, 74, y_offset).assert_ok();
+    let _ = buffer.blit(display, 74, y_offset);
 }
 
 #[inline(never)]
-fn draw_submenu_item_label<DI, SIZE>(
+fn draw_item_label<DI, SIZE>(
     y_offset: u8,
     invert: bool,
-    item: SubMenuItem,
+    item: MenuItem,
     display: &mut ssd1306::Ssd1306<DI, SIZE, ssd1306::mode::BasicMode>,
 ) where
     DI: display_interface::WriteOnlyDataCommand,
@@ -249,7 +259,7 @@ fn draw_submenu_item_label<DI, SIZE>(
     let mut buffer = MiniBuffer::<74, 24>::new();
 
     if invert {
-        buffer.clear(BinaryColor::On).assert_ok();
+        let _ = buffer.clear(BinaryColor::On);
     }
 
     let text_color = match invert {
@@ -257,46 +267,20 @@ fn draw_submenu_item_label<DI, SIZE>(
         false => &TextColor::BinaryOn,
     };
 
-    match item {
-        SubMenuItem::Division => buffer.fast_draw_ascii_text(
-            Justify::Start(2),
-            Justify::Start(1),
-            F!("Tempo").as_bytes(),
-            &PRO_FONT_22,
-            text_color,
-        ),
-        SubMenuItem::PulseWidth => buffer.fast_draw_ascii_text(
-            Justify::Start(2),
-            Justify::Start(1),
-            F!("PulseW").as_bytes(),
-            &PRO_FONT_22,
-            text_color,
-        ),
-        SubMenuItem::PhaseShift => buffer.fast_draw_ascii_text(
-            Justify::Start(2),
-            Justify::Start(1),
-            F!("Phase").as_bytes(),
-            &PRO_FONT_22,
-            text_color,
-        ),
-        SubMenuItem::Swing => buffer.fast_draw_ascii_text(
-            Justify::Start(2),
-            Justify::Start(1),
-            F!("Swing").as_bytes(),
-            &PRO_FONT_22,
-            text_color,
-        ),
-        SubMenuItem::Exit => {
-            let img = RETURN_ARROW.load();
-            buffer.fast_draw_image(2, 0, 19, 24, &img, text_color);
-            buffer.fast_draw_ascii_text(
-                Justify::Start(26),
-                Justify::Start(1),
-                F!("Exit").as_bytes(),
-                &PRO_FONT_22,
-                text_color,
-            );
-        }
+    let mut x = 2;
+    if item == MenuItem::Exit {
+        let img = RETURN_ARROW.load();
+        buffer.fast_draw_image(2, 0, 19, 24, &img, text_color);
+        x = 26;
     }
-    buffer.blit(display, 0, y_offset).assert_ok();
+    let label = LABELS.load_at(item as usize);
+    let len = label.iter().position(|c| *c == 0).unwrap_or(label.len());
+    buffer.fast_draw_ascii_text(
+        Justify::Start(x),
+        Justify::Start(1),
+        &label[..len],
+        &PRO_FONT_22,
+        text_color,
+    );
+    let _ = buffer.blit(display, 0, y_offset);
 }

@@ -1,10 +1,5 @@
 use display_interface::{DisplayError, WriteOnlyDataCommand};
-use embedded_graphics::{
-    pixelcolor::BinaryColor,
-    prelude::{Dimensions, DrawTarget, Point, Size},
-    primitives::Rectangle,
-    Pixel,
-};
+use embedded_graphics::pixelcolor::BinaryColor;
 use ssd1306::{mode::BasicMode, size::DisplaySize, Ssd1306};
 
 use crate::font::{get_font_buffer_size, get_glyph_size_bytes, CharSet, ProgmemBitmapFont};
@@ -19,77 +14,48 @@ the shapes you're drawing don't exactly line up with the underlying pages of the
 display driver, and could also lead to flickering from non-sequential updates.
 
 As a compromise, the mini buffer is a variable-size buffer that can back just a small
-portion of the screen. It can be drawn to like a display using embedded_graphics, and
-then can be efficiently copied to the display driver using the blit function.
+portion of the screen. It can be drawn to and then efficiently copied to the display
+driver using the blit function.
+
+All the drawing code lives in the non-generic `Canvas` so that it is only compiled
+once, no matter how many different buffer sizes are used. Flash is very tight.
  */
 #[repr(transparent)]
 pub struct MiniBuffer<const WIDTH: usize, const HEIGHT: usize>([u8; WIDTH * HEIGHT / BYTE_SIZE])
 where
     [(); WIDTH * HEIGHT / BYTE_SIZE]: Sized;
 
-impl<const WIDTH: usize, const HEIGHT: usize> DrawTarget for MiniBuffer<WIDTH, HEIGHT>
-where
-    [(); WIDTH * HEIGHT / BYTE_SIZE]: Sized,
-{
-    type Color = BinaryColor;
-
-    type Error = ();
-
-    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-    where
-        I: IntoIterator<Item = embedded_graphics::Pixel<Self::Color>>,
-    {
-        for Pixel(point, color) in pixels {
-            let x = point.x.clamp(0, 255) as usize;
-            let y = point.y.clamp(0, 255) as usize;
-
-            let bit_offset = x * HEIGHT + y;
-            let bytes = bit_offset / BYTE_SIZE;
-            let bits = bit_offset % BYTE_SIZE;
-            if bytes >= self.0.len() {
-                return Ok(());
-            };
-            let bit_mask = 1 << bits;
-
-            debug_assert!(bytes < self.0.len());
-            let addr = unsafe { self.0.get_unchecked_mut(bytes) };
-
-            if color.is_on() {
-                *addr |= bit_mask;
-            } else {
-                *addr &= !bit_mask;
-            }
-        }
-        Ok(())
-    }
-
-    fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
-        let fill = match color {
-            BinaryColor::Off => 0u8,
-            BinaryColor::On => 0xffu8,
-        };
-        self.0.fill(fill);
-        Ok(())
-    }
-
-    fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
-        let width = area.size.width.min(usize::MAX as u32) as usize;
-        let height = area.size.height.min(usize::MAX as u32) as usize;
-        let x = area.top_left.x.clamp(0, usize::MAX as i32) as usize;
-        let y = area.top_left.y.clamp(0, usize::MAX as i32) as usize;
-
-        self.fast_fill(x, y, width, height, color);
-        Ok(())
-    }
-}
-
 impl<const WIDTH: usize, const HEIGHT: usize> MiniBuffer<WIDTH, HEIGHT>
 where
     [(); WIDTH * HEIGHT / BYTE_SIZE]: Sized,
 {
+    pub const fn new() -> Self {
+        if HEIGHT % BYTE_SIZE != 0 {
+            panic!()
+        }
+        MiniBuffer([0u8; WIDTH * HEIGHT / BYTE_SIZE])
+    }
+
+    #[inline(always)]
+    fn canvas(&mut self) -> Canvas<'_> {
+        Canvas {
+            data: &mut self.0,
+            width: WIDTH,
+            height: HEIGHT,
+        }
+    }
+
+    pub fn clear(&mut self, color: BinaryColor) {
+        self.0.fill(match color {
+            BinaryColor::Off => 0u8,
+            BinaryColor::On => 0xffu8,
+        });
+    }
+
     /**
     Efficiently copy the contents of the buffer to the SSD1306 driver in BasicMode
     */
+    #[inline(always)]
     pub fn blit<DI, SIZE>(
         &self,
         display: &mut Ssd1306<DI, SIZE, BasicMode>,
@@ -100,50 +66,10 @@ where
         DI: WriteOnlyDataCommand,
         SIZE: DisplaySize,
     {
-        if y % 8 != 0 {
-            return Err(DisplayError::OutOfBoundsError);
-        }
-        let (display_width, display_height) = display.dimensions();
-        if x + WIDTH as u8 > display_width as u8 || y + HEIGHT as u8 > display_height as u8 {
-            return Err(DisplayError::OutOfBoundsError);
-        }
-        display.set_draw_area((x, y), (x + WIDTH as u8, y + HEIGHT as u8))?;
-        display.draw(&self.0)?;
-        Ok(())
+        blit_raw(&self.0, WIDTH as u8, HEIGHT as u8, display, x, y)
     }
 
-    fn get_byte_at(&mut self, col: usize, page: usize) -> &mut u8 {
-        let index = col * HEIGHT / BYTE_SIZE + page;
-        debug_assert!(index < self.0.len());
-        unsafe { self.0.get_unchecked_mut(index) }
-    }
-
-    fn write_byte_if_in_bounds(&mut self, col: usize, page: usize, value: u8, color: &TextColor) {
-        if page >= HEIGHT / BYTE_SIZE {
-            return;
-        }
-        if col >= WIDTH {
-            return;
-        }
-        let current = self.get_byte_at(col, page);
-        return *current = match color {
-            TextColor::BinaryOn => value,
-            TextColor::BinaryOff => !value,
-            TextColor::BinaryOnTransparent => *current | value,
-            TextColor::BinaryOffTransparent => *current & !value,
-            TextColor::InvertTransparent => (*current & !value) | (!*current & value),
-        };
-    }
-
-    pub const fn new() -> Self {
-        if HEIGHT % BYTE_SIZE != 0 {
-            panic!()
-        }
-        let buffer = [0u8; WIDTH * HEIGHT / BYTE_SIZE];
-        return MiniBuffer(buffer);
-    }
-
-    #[inline(never)]
+    #[inline(always)]
     pub fn fast_draw_image(
         &mut self,
         x: usize,
@@ -153,11 +79,116 @@ where
         raw_data: &[u8],
         color: &TextColor,
     ) {
-        self.fast_draw_image_inline(x, y, img_width, img_height, raw_data, color)
+        self.canvas()
+            .draw_image(x, y, img_width, img_height, raw_data, color)
+    }
+
+    /**
+    Drawing text with embedded_graphics requires loading the full font into memory,
+    which there isn't room for in the atmega. Also, it is relatively slow. This
+    function takes advantage of specifically formatted font data stored in PROGMEM
+    and the column-major layout of the buffer to draw text very efficiently.
+    */
+    #[inline(always)]
+    pub fn fast_draw_ascii_text<
+        const GLYPH_WIDTH: u8,
+        const GLYPH_HEIGHT: u8,
+        const CHARSET: CharSet,
+    >(
+        &mut self,
+        horizontal: Justify,
+        vertical: Justify,
+        text: &[u8],
+        font: &'static ProgmemBitmapFont<GLYPH_WIDTH, GLYPH_HEIGHT, CHARSET>,
+        color: &TextColor,
+    ) where
+        [(); get_font_buffer_size(GLYPH_WIDTH, GLYPH_HEIGHT, CHARSET)]: Sized,
+        [(); get_glyph_size_bytes(GLYPH_WIDTH, GLYPH_HEIGHT)]: Sized,
+    {
+        draw_text(&mut self.canvas(), horizontal, vertical, text, font, color)
     }
 
     #[inline(always)]
-    fn fast_draw_image_inline(
+    pub fn fast_rect(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        color: BinaryColor,
+        thickness: usize,
+    ) {
+        self.canvas().rect(x, y, width, height, color, thickness)
+    }
+
+    #[inline(always)]
+    pub fn fast_fill(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        color: BinaryColor,
+    ) {
+        self.canvas().fill(x, y, width, height, color)
+    }
+}
+
+#[inline(never)]
+fn blit_raw<DI, SIZE>(
+    data: &[u8],
+    width: u8,
+    height: u8,
+    display: &mut Ssd1306<DI, SIZE, BasicMode>,
+    x: u8,
+    y: u8,
+) -> Result<(), DisplayError>
+where
+    DI: WriteOnlyDataCommand,
+    SIZE: DisplaySize,
+{
+    if y % 8 != 0 {
+        return Err(DisplayError::OutOfBoundsError);
+    }
+    let (display_width, display_height) = display.dimensions();
+    if x + width > display_width as u8 || y + height > display_height as u8 {
+        return Err(DisplayError::OutOfBoundsError);
+    }
+    display.set_draw_area((x, y), (x + width, y + height))?;
+    display.draw(data)?;
+    Ok(())
+}
+
+/// Column-major 1-bit bitmap matching the SSD1306 page layout
+pub struct Canvas<'a> {
+    data: &'a mut [u8],
+    width: usize,
+    height: usize,
+}
+
+impl<'a> Canvas<'a> {
+    fn get_byte_at(&mut self, col: usize, page: usize) -> &mut u8 {
+        let index = col * (self.height / BYTE_SIZE) + page;
+        debug_assert!(index < self.data.len());
+        unsafe { self.data.get_unchecked_mut(index) }
+    }
+
+    fn write_byte_if_in_bounds(&mut self, col: usize, page: usize, value: u8, color: &TextColor) {
+        if page >= self.height / BYTE_SIZE || col >= self.width {
+            return;
+        }
+        let current = self.get_byte_at(col, page);
+        *current = match color {
+            TextColor::BinaryOn => value,
+            TextColor::BinaryOff => !value,
+            TextColor::BinaryOnTransparent => *current | value,
+            TextColor::BinaryOffTransparent => *current & !value,
+            TextColor::InvertTransparent => *current ^ value,
+        };
+    }
+
+    #[inline(never)]
+    pub fn draw_image(
         &mut self,
         x: usize,
         y: usize,
@@ -170,14 +201,14 @@ where
         let y_offset_bits = (y % BYTE_SIZE) as u8;
         let img_height_bytes: u8 = img_height.div_ceil(u8::BITS as u8);
 
+        let mut offset_in_glyph = 0usize;
         for col_in_glyph in 0..img_width {
             let col_in_buff = col_in_glyph as usize + x;
             let mut last_byte_in_glyph = 0u8;
             for byte_idx_in_glyph in 0..img_height_bytes {
-                let offset_in_glyph =
-                    col_in_glyph as usize * img_height_bytes as usize + byte_idx_in_glyph as usize;
                 debug_assert!(offset_in_glyph < raw_data.len());
                 let byte_in_glyph = unsafe { *raw_data.get_unchecked(offset_in_glyph) };
+                offset_in_glyph += 1;
                 let byte_to_write = if y_offset_bits == 0 {
                     byte_in_glyph
                 } else {
@@ -194,7 +225,6 @@ where
                 )
             }
             if img_height + y_offset_bits > img_height_bytes * (u8::BITS as u8) {
-                debug_assert_ne!(y_offset_bits, 0);
                 self.write_byte_if_in_bounds(
                     col_in_buff,
                     img_height_bytes as usize + y_offset_bytes,
@@ -205,53 +235,8 @@ where
         }
     }
 
-    /**
-    Drawing text with embedded_graphics requires loading the full font into memory,
-    which there isn't room for in the atmega. Also, it is relatively slow. This
-    function takes advantage of specifically formatted font data stored in PROGMEM
-    and the column-major layout of the buffer to draw text very efficiently.
-    */
-    pub fn fast_draw_ascii_text<
-        const GLYPH_WIDTH: u8,
-        const GLYPH_HEIGHT: u8,
-        const CHARSET: CharSet,
-    >(
-        &mut self,
-        horizontal: Justify,
-        vertical: Justify,
-        text: &[u8],
-        font: &'static ProgmemBitmapFont<GLYPH_WIDTH, GLYPH_HEIGHT, CHARSET>,
-        color: &TextColor,
-    ) where
-        [(); get_font_buffer_size(GLYPH_WIDTH, GLYPH_HEIGHT, CHARSET)]: Sized,
-        [(); get_glyph_size_bytes(GLYPH_WIDTH, GLYPH_HEIGHT)]: Sized,
-    {
-        let text_width = GLYPH_WIDTH as usize * text.len();
-        // NOTE: if we want to allow negative offset, we could make x and y i16 and
-        // add a bounds check to the loop then cast back, but it's faster to not as
-        // long as it's not used
-        let x = match horizontal {
-            Justify::Start(offset) => offset,
-            Justify::Center(offset) => offset.saturating_sub(text_width / 2),
-            Justify::End(offset) => offset.saturating_sub(text_width),
-        };
-        let y = match vertical {
-            Justify::Start(offset) => offset,
-            Justify::Center(offset) => offset.saturating_sub(GLYPH_HEIGHT as usize / 2),
-            Justify::End(offset) => offset.saturating_sub(GLYPH_HEIGHT as usize),
-        };
-
-        let mut cursor = x;
-        for ascii_char in text {
-            let glyph = font.get_glyph(*ascii_char);
-
-            self.fast_draw_image_inline(cursor, y, GLYPH_WIDTH, GLYPH_HEIGHT, &glyph, color);
-
-            cursor += GLYPH_WIDTH as usize;
-        }
-    }
-
-    pub fn fast_rect(
+    #[inline(never)]
+    pub fn rect(
         &mut self,
         x: usize,
         y: usize,
@@ -260,78 +245,60 @@ where
         color: BinaryColor,
         thickness: usize,
     ) {
-        self.fast_fill(x, y, width, thickness, color);
-        self.fast_fill(x, y + height - thickness, width, thickness, color);
-        self.fast_fill(x, y, thickness, height, color);
-        self.fast_fill(x + width - thickness, y, thickness, height, color);
+        self.fill(x, y, width, thickness, color);
+        self.fill(x, y + height - thickness, width, thickness, color);
+        self.fill(x, y, thickness, height, color);
+        self.fill(x + width - thickness, y, thickness, height, color);
     }
 
-    pub fn fast_fill(
-        &mut self,
-        x: usize,
-        y: usize,
-        width: usize,
-        height: usize,
-        color: BinaryColor,
-    ) {
-        if height == 0 || width == 0 {
-            return;
-        }
-
-        let fill = match color {
-            BinaryColor::Off => 0u8,
-            BinaryColor::On => 0xffu8,
-        };
-        let left_bound_inclusive = x.clamp(0, WIDTH) as usize;
-        let right_bound_exclusive = (left_bound_inclusive + width).min(WIDTH);
-        let upper_bound_inclusive = y.clamp(0, HEIGHT) as usize;
-        let lower_bound_exclusive = (upper_bound_inclusive + height).min(HEIGHT);
-
-        // if start and end are on the same page, handle that with a special case
-        if upper_bound_inclusive / BYTE_SIZE == (lower_bound_exclusive - 1) / BYTE_SIZE {
-            let byte_idx = upper_bound_inclusive / BYTE_SIZE;
-            let bit_offset = upper_bound_inclusive % BYTE_SIZE;
-            let bit_offset_from_end = ((byte_idx + 1) * BYTE_SIZE) - lower_bound_exclusive;
-            let mask = (0xffu8 << bit_offset) & (0xffu8 >> bit_offset_from_end);
-            for col in left_bound_inclusive..right_bound_exclusive {
-                let current_byte = self.get_byte_at(col, byte_idx);
-                *current_byte = match color {
-                    BinaryColor::Off => *current_byte & !mask,
-                    BinaryColor::On => *current_byte | mask,
-                };
-            }
-            return;
-        }
-
-        for col in left_bound_inclusive..right_bound_exclusive {
-            let mut v_cursor_bits = upper_bound_inclusive;
-            // (maybe) fill first partial byte
-            let bit_shift_in_first_byte = v_cursor_bits % BYTE_SIZE;
-            if bit_shift_in_first_byte != 0 {
-                let current_byte = self.get_byte_at(col, v_cursor_bits / BYTE_SIZE);
-                *current_byte = match color {
-                    BinaryColor::Off => *current_byte & !(0xffu8 << bit_shift_in_first_byte),
-                    BinaryColor::On => *current_byte | 0xffu8 << bit_shift_in_first_byte,
-                };
-                v_cursor_bits += BYTE_SIZE - bit_shift_in_first_byte;
-            }
-            // fill all full bytes in column
-            debug_assert!(v_cursor_bits % BYTE_SIZE == 0);
-            while lower_bound_exclusive - v_cursor_bits >= 8 {
-                *self.get_byte_at(col, v_cursor_bits / BYTE_SIZE) = fill;
-                v_cursor_bits += 8;
-            }
-            // (maybe) fill last partial byte
-            let remaining_bits_to_fill = lower_bound_exclusive - v_cursor_bits;
-            if remaining_bits_to_fill > 0 {
-                let last_byte_mask = 0xffu8 >> (BYTE_SIZE - remaining_bits_to_fill);
-                let current_byte = self.get_byte_at(col, v_cursor_bits / BYTE_SIZE);
-                *current_byte = match color {
-                    BinaryColor::Off => *current_byte & !last_byte_mask,
-                    BinaryColor::On => *current_byte | last_byte_mask,
-                };
+    /// Fill a rectangle, one pixel at a time per column. Simple and small; the
+    /// rectangles drawn here are small enough that speed doesn't matter.
+    #[inline(never)]
+    pub fn fill(&mut self, x: usize, y: usize, width: usize, height: usize, color: BinaryColor) {
+        let right = (x + width).min(self.width);
+        let bottom = (y + height).min(self.height);
+        for col in x..right {
+            for row in y..bottom {
+                let mask = 1u8 << (row % BYTE_SIZE);
+                let byte = self.get_byte_at(col, row / BYTE_SIZE);
+                match color {
+                    BinaryColor::Off => *byte &= !mask,
+                    BinaryColor::On => *byte |= mask,
+                }
             }
         }
+    }
+}
+
+#[inline(never)]
+fn draw_text<const GLYPH_WIDTH: u8, const GLYPH_HEIGHT: u8, const CHARSET: CharSet>(
+    canvas: &mut Canvas,
+    horizontal: Justify,
+    vertical: Justify,
+    text: &[u8],
+    font: &'static ProgmemBitmapFont<GLYPH_WIDTH, GLYPH_HEIGHT, CHARSET>,
+    color: &TextColor,
+) where
+    [(); get_font_buffer_size(GLYPH_WIDTH, GLYPH_HEIGHT, CHARSET)]: Sized,
+    [(); get_glyph_size_bytes(GLYPH_WIDTH, GLYPH_HEIGHT)]: Sized,
+{
+    let text_width = GLYPH_WIDTH as usize * text.len();
+    let x = match horizontal {
+        Justify::Start(offset) => offset,
+        Justify::Center(offset) => offset.saturating_sub(text_width / 2),
+        Justify::End(offset) => offset.saturating_sub(text_width),
+    };
+    let y = match vertical {
+        Justify::Start(offset) => offset,
+        Justify::Center(offset) => offset.saturating_sub(GLYPH_HEIGHT as usize / 2),
+        Justify::End(offset) => offset.saturating_sub(GLYPH_HEIGHT as usize),
+    };
+
+    let mut cursor = x;
+    for ascii_char in text {
+        let glyph = font.get_glyph(*ascii_char);
+        canvas.draw_image(cursor, y, GLYPH_WIDTH, GLYPH_HEIGHT, &glyph, color);
+        cursor += GLYPH_WIDTH as usize;
     }
 }
 
@@ -349,13 +316,4 @@ pub enum TextColor {
     BinaryOnTransparent,
     BinaryOffTransparent,
     InvertTransparent,
-}
-
-impl<const WIDTH: usize, const HEIGHT: usize> Dimensions for MiniBuffer<WIDTH, HEIGHT>
-where
-    [(); WIDTH * HEIGHT / BYTE_SIZE]: Sized,
-{
-    fn bounding_box(&self) -> Rectangle {
-        return Rectangle::new(Point::new(0, 0), Size::new(WIDTH as u32, HEIGHT as u32));
-    }
 }

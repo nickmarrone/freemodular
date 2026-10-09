@@ -1,0 +1,11 @@
+# Host-side unit tests for the clock engine. The firmware itself only builds for AVR,
+# so this crate pulls in the hardware-independent source files directly.
+#
+#   cd modules/Clock/tests/engine && cargo test
+[package]
+name = "fm-clock-engine-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]

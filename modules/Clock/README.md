@@ -7,7 +7,7 @@
 
 <h1>Clock</h1>
 
-<p>A basic, 8-channel clock source with adjustable tempo, phase shift, pulse width, and swing.</p>
+<p>An 8-channel clock source with adjustable tempo, phase shift, pulse width, swing, triplets, probability, and Euclidean rhythms, plus tap tempo, run/stop/reset outputs, and presets.</p>
 
 <p>If you want to do virtually anything with rhythm in your modular rack, you will need a clock source to keep all your modules in sync. This module sends out triggers on each of its 8 channels that are all different subdivisions of the same tempo. Use them to trigger samples, ping envelopes, step sequencers, or whatever else you want to happen on beat.</p>
 

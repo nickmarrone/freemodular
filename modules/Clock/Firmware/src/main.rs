@@ -18,20 +18,17 @@ mod render_numbers;
 
 use arduino_hal::hal::port::{PC3, PC4};
 use avr_device::interrupt;
-use clock::{ClockConfig, ClockState};
+use clock::ClockConfig;
 use core::panic::PanicInfo;
 use eeprom::PersistanceManager;
 use fm_lib::button_debouncer::{ButtonWithLongPress, LongPressButtonState};
 use fm_lib::debug_unwrap::DebugUnwrap;
-use fm_lib::handle_system_clock_interrupt;
 use fm_lib::rotary_encoder::RotaryEncoderHandler;
-use fm_lib::system_clock::{ClockPrecision, GlobalSystemClockState, SystemClock};
-use menu::{render_menu, update_menu, MenuOrScreenSaverState, MenuUpdate};
+use menu::{
+    render_menu, update_menu, ConfigChange, MenuOrScreenSaverState, MenuPage, MenuState,
+    MenuUpdate,
+};
 use ssd1306::{prelude::*, Ssd1306};
-
-static SYSTEM_CLOCK_STATE: GlobalSystemClockState<{ ClockPrecision::MS16 }> =
-    GlobalSystemClockState::new();
-handle_system_clock_interrupt!(&SYSTEM_CLOCK_STATE);
 
 #[inline(never)]
 #[panic_handler]
@@ -39,20 +36,12 @@ fn panic(_info: &PanicInfo) -> ! {
     interrupt::disable();
 
     let dp = unsafe { arduino_hal::Peripherals::steal() };
-    let pins = arduino_hal::pins!(dp);
-
-    const SHORT: u16 = 100;
-    const LONG: u16 = 500;
-    let mut led = pins.d13.into_output();
+    dp.PORTD.portd.write(|w| unsafe { w.bits(0) });
+    dp.PORTB.ddrb.write(|w| w.pb5().set_bit());
     loop {
-        for len in [SHORT, LONG] {
-            for _ in 0..3u8 {
-                led.set_high();
-                arduino_hal::delay_ms(len);
-                led.set_low();
-                arduino_hal::delay_ms(SHORT);
-            }
-        }
+        // writing to PINx toggles the pin
+        dp.PORTB.pinb.write(|w| w.pb5().set_bit());
+        arduino_hal::delay_ms(150);
     }
 }
 
@@ -76,10 +65,7 @@ fn main() -> ! {
     let dp = arduino_hal::Peripherals::take().assert_ok();
 
     let mut clock_config = ClockConfig::new();
-    let mut persistance_manager = PersistanceManager::new(dp.EEPROM, &mut clock_config);
-
-    // start system clock
-    let sys_clock = SystemClock::init_system_clock(dp.TC0, &SYSTEM_CLOCK_STATE);
+    let mut persistance_manager = PersistanceManager::new(&mut clock_config);
 
     // set pins d0-d7 as output
     dp.PORTD.ddrd.write(|w| unsafe { w.bits(0xff) });
@@ -90,6 +76,10 @@ fn main() -> ! {
     dp.EXINT.pcifr.reset();
     dp.EXINT.pcmsk0.write(|w| w.pcint().bits(0b00000011));
     dp.EXINT.pcicr.write(|w| w.pcie().bits(0b001));
+
+    // start the clock engine; outputs are driven from the TIMER1 interrupt
+    clock::init_timer(dp.TC1);
+    clock::start(&clock_config);
 
     // turn on interrupts
     unsafe {
@@ -118,23 +108,16 @@ fn main() -> ! {
         );
 
         let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0);
-        display
-            .reset(&mut pins.a0.into_output(), &mut arduino_hal::Delay::new())
-            .assert_ok();
-        display
-            .init_with_addr_mode(ssd1306::command::AddrMode::Vertical)
-            .assert_ok();
-        display.clear().assert_ok();
+        let _ = display.reset(&mut pins.a0.into_output(), &mut arduino_hal::Delay::new());
+        let _ = display.init_with_addr_mode(ssd1306::command::AddrMode::Vertical);
+        let _ = display.clear();
         display
     };
 
     // set up app state
     let mut encoder_button = ButtonWithLongPress::<PC4, 32, 500>::new(pins.a4.into_pull_up_input());
-    let mut pause_button = ButtonWithLongPress::<PC3, 32, 2500>::new(pins.a3.into_pull_up_input());
-    let mut menu_state = MenuOrScreenSaverState::new(0);
-    let mut clock_state = ClockState::new();
-    let mut is_paused = false;
-    let mut start_time: u64 = 0;
+    let mut pause_button = ButtonWithLongPress::<PC3, 32, 2000>::new(pins.a3.into_pull_up_input());
+    let mut menu_state = MenuOrScreenSaverState::new(clock::millis());
 
     render_menu(
         &menu_state,
@@ -143,72 +126,66 @@ fn main() -> ! {
         &mut display,
     );
 
-    // I want to use direct port manipulation for performance but also the
-    // individual pins from the board support library for convenience at the
-    // same time, which isn't allowed by the borrow checker, so I have to use
-    // an unsafe copy of the references to the ports here
-    let unsafe_peripherals = unsafe { arduino_hal::Peripherals::steal() };
-
-    // Main loop. Will run for the rest of the program
+    // Main loop. Only handles the UI; clock timing is entirely interrupt driven.
     loop {
-        // use ms for menu logic but use micros for clock to reduce aliasing
-        let current_time_us = sys_clock.micros();
-        let current_time_ms = (current_time_us / 1000) as u32;
+        let current_time_ms = clock::millis();
+
         // Handle pause button
-        let pause_button_state = pause_button.sample(current_time_ms);
-        match pause_button_state {
+        match pause_button.sample(current_time_ms) {
             LongPressButtonState::ButtonJustDown => {
-                is_paused = !is_paused;
-                if !is_paused {
-                    clock_state.reset();
-                    start_time = current_time_us;
+                if !clock::is_running() {
+                    clock::start(&clock_config);
+                } else if clock::stop_is_pending() {
+                    clock::cancel_stop();
+                } else {
+                    clock::stop(clock_config.stop_mode);
                 }
-                menu_state = MenuOrScreenSaverState::new(current_time_ms);
-                render_menu(
-                    &menu_state,
-                    &clock_config,
-                    // TODO this causes a slight flicker. Calculate what the actual
-                    // update should be
-                    &MenuUpdate::SwitchScreens,
-                    &mut display,
-                );
             }
             LongPressButtonState::ButtonJustClickedLong => {
-                clock_config = ClockConfig::new();
-                clock_state.reset();
-                start_time = current_time_us;
-                menu_state = MenuOrScreenSaverState::new(current_time_ms);
-                is_paused = false;
+                // ask for confirmation before erasing everything
+                let mut state = MenuState::new(current_time_ms);
+                state.page = MenuPage::ConfirmReset;
+                menu_state = MenuOrScreenSaverState::Menu(state);
                 render_menu(
                     &menu_state,
                     &clock_config,
                     &MenuUpdate::SwitchScreens,
                     &mut display,
                 );
-                persistance_manager.overwrite(&clock_config);
             }
             _ => {}
         }
 
-        // Handle clock logic and write clock state to output pins
-        let clock_time = current_time_us.wrapping_sub(start_time);
-        let (pin_state, did_rollover) =
-            clock::sample(&clock_config, &mut clock_state, clock_time, is_paused);
-        unsafe_peripherals
-            .PORTD
-            .portd
-            .write(|w| unsafe { w.bits(pin_state) });
-
         // Handle menu logic
-        let menu_update = update_menu(
+        let (mut menu_update, change) = update_menu(
             &mut menu_state,
             &mut clock_config,
             &mut encoder_button,
             &ROTARY_ENCODER,
             current_time_ms,
-            did_rollover,
+            clock::take_beat_flag(),
             &mut persistance_manager,
         );
+
+        match change {
+            ConfigChange::None => {}
+            ConfigChange::Params => {
+                clock::apply_config(&clock_config, 0);
+                persistance_manager.mark_dirty(current_time_ms);
+            }
+            ConfigChange::Realign(mask) => {
+                clock::apply_config(&clock_config, mask);
+                persistance_manager.mark_dirty(current_time_ms);
+            }
+            ConfigChange::FactoryReset => {
+                clock_config = ClockConfig::new();
+                persistance_manager.save(&clock_config);
+                clock::start(&clock_config);
+                menu_state = MenuOrScreenSaverState::new(current_time_ms);
+                menu_update = MenuUpdate::SwitchScreens;
+            }
+        }
+        persistance_manager.poll(&clock_config, current_time_ms);
 
         // Only re-render the part of the screen that needs to be updated, if any
         if menu_update != MenuUpdate::NoUpdate {

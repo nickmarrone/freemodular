@@ -1,3 +1,5 @@
+use crate::clock::{MAX_DIVISION, MIN_DIVISION};
+
 trait LowerPowerOfTwo {
     /**
     Returns the largest power of two less than the given number, or 0
@@ -18,21 +20,25 @@ impl LowerPowerOfTwo for u8 {
     }
 }
 
+/// Steps a division through powers of two: x64 ... x1, /2 ... /64, then one at a
+/// time through the special values (STOP, RUN, RESET)
 pub fn step_clock_division(mut current_value: i8, mut delta: i8) -> i8 {
     while delta != 0 {
-        let sign = current_value.signum();
         let delta_sign = delta.signum();
-        let abs_value = current_value.abs() as u8;
-        current_value = if (delta_sign * sign) > 0 {
-            (abs_value + 1)
-                .next_power_of_two()
-                .min(if delta_sign < 0 { 65 } else { 64 })
+        if current_value < -64 || (current_value == -64 && delta_sign < 0) {
+            current_value = (current_value + delta_sign).clamp(MIN_DIVISION, -64);
         } else {
-            abs_value.lower_power_of_two()
-        } as i8
-            * sign;
-        if current_value == 0 || current_value == -1 {
-            current_value = if delta_sign < 0 { -2 } else { 1 };
+            let sign = current_value.signum();
+            let abs_value = current_value.abs() as u8;
+            current_value = if (delta_sign * sign) > 0 {
+                (abs_value + 1).next_power_of_two().min(64)
+            } else {
+                abs_value.lower_power_of_two()
+            } as i8
+                * sign;
+            if current_value == 0 || current_value == -1 {
+                current_value = if delta_sign < 0 { -2 } else { 1 };
+            }
         }
         delta -= delta_sign;
     }
@@ -42,8 +48,7 @@ pub fn step_clock_division(mut current_value: i8, mut delta: i8) -> i8 {
 pub fn single_step_clock_division(mut current_value: i8, mut delta: i8) -> i8 {
     while delta != 0 {
         let delta_sign = delta.signum();
-        current_value += delta_sign;
-        current_value = current_value.clamp(-65, 64);
+        current_value = (current_value + delta_sign).clamp(MIN_DIVISION, MAX_DIVISION);
         if current_value == 0 || current_value == -1 {
             current_value = if delta_sign < 0 { -2 } else { 1 };
         }
